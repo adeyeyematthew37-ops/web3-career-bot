@@ -90,6 +90,162 @@ async def fetch_web3_jobs() -> list[dict]:
     return jobs
 
 
+async def fetch_grants() -> list[dict]:
+    """Fetch active Web3 grants and hackathons from public sources."""
+    grants = []
+
+    # Gitcoin Grants — active rounds via Grants Stack API
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://grants-stack-indexer-v2.gitcoin.co/graphql"
+            query = """{"query":"{rounds(filter:{strategyName:{equalTo:\\"allov2.DonationVotingMerkleDistributionDirectTransferStrategy\\"},roundMetadata:{isNot:null}},first:10,orderBy:CREATED_AT_BLOCK_DESC){nodes{id chainId roundMetadata applicationMetadata}}}"}"""
+            async with session.post(url, data=query, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    nodes = data.get("data", {}).get("rounds", {}).get("nodes", [])
+                    for r in nodes[:5]:
+                        meta = r.get("roundMetadata") or {}
+                        name = meta.get("name", "Gitcoin Round")
+                        desc = (meta.get("description") or "")[:120]
+                        grants.append({
+                            "name": name,
+                            "platform": "Gitcoin",
+                            "type": "Grant Round",
+                            "description": desc,
+                            "url": f"https://explorer.gitcoin.co/#/round/{r.get('chainId','1')}/{r.get('id','')}",
+                            "amount": "Varies",
+                            "deadline": "Active now",
+                        })
+    except Exception as e:
+        logger.warning(f"Gitcoin fetch failed: {e}")
+
+    # DoraHacks — active hackathons via public API
+    try:
+        async with aiohttp.ClientSession() as session:
+            url = "https://dorahacks.io/api/hackathoninformation/?limit=8&offset=0&status=open"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json(content_type=None)
+                    items = data.get("data", data) if isinstance(data, dict) else data
+                    if isinstance(items, list):
+                        for h in items[:5]:
+                            title = h.get("title") or h.get("name", "DoraHacks Hackathon")
+                            prize = h.get("prize_pool") or h.get("total_prize", "")
+                            prize_str = f"${prize:,}" if isinstance(prize, (int, float)) and prize else str(prize) or "Prize pool available"
+                            slug = h.get("id") or h.get("slug", "")
+                            grants.append({
+                                "name": title,
+                                "platform": "DoraHacks",
+                                "type": "Hackathon",
+                                "description": (h.get("description") or "")[:120],
+                                "url": f"https://dorahacks.io/hackathon/{slug}/detail",
+                                "amount": prize_str,
+                                "deadline": h.get("end_time", "Check site")[:10] if h.get("end_time") else "Check site",
+                            })
+    except Exception as e:
+        logger.warning(f"DoraHacks fetch failed: {e}")
+
+    if not grants:
+        # Curated fallback — real recurring programs
+        grants = [
+            {
+                "name": "Optimism Retroactive Public Goods Funding",
+                "platform": "Optimism RPGF",
+                "type": "Retroactive Grant",
+                "description": "Rewards projects that have created positive impact for the Optimism ecosystem.",
+                "url": "https://app.optimism.io/retropgf",
+                "amount": "Millions OP",
+                "deadline": "Round-based",
+            },
+            {
+                "name": "Ethereum Foundation ESP",
+                "platform": "Ethereum Foundation",
+                "type": "Grant",
+                "description": "Ecosystem Support Program for projects strengthening Ethereum and its ecosystem.",
+                "url": "https://esp.ethereum.foundation",
+                "amount": "Up to $250K",
+                "deadline": "Rolling",
+            },
+            {
+                "name": "Gitcoin Grants Program",
+                "platform": "Gitcoin",
+                "type": "Grant Round",
+                "description": "Quadratic funding rounds for open-source public goods projects.",
+                "url": "https://explorer.gitcoin.co",
+                "amount": "Varies by matching pool",
+                "deadline": "Seasonal rounds",
+            },
+            {
+                "name": "Uniswap Foundation Grants",
+                "platform": "Uniswap Foundation",
+                "type": "Grant",
+                "description": "Funds research, tooling, and community projects for the Uniswap ecosystem.",
+                "url": "https://uniswapfoundation.mirror.xyz",
+                "amount": "$10K – $250K",
+                "deadline": "Rolling",
+            },
+            {
+                "name": "Arbitrum DAO Grants Program",
+                "platform": "Arbitrum",
+                "type": "DAO Grant",
+                "description": "Community grants for builders on Arbitrum One and Arbitrum Nova.",
+                "url": "https://arbitrum.foundation/grants",
+                "amount": "Up to $100K ARB",
+                "deadline": "Rolling",
+            },
+            {
+                "name": "Polygon Village Grants",
+                "platform": "Polygon",
+                "type": "Grant",
+                "description": "Funding for projects building on Polygon PoS, zkEVM, and Miden.",
+                "url": "https://polygon.technology/village/grants",
+                "amount": "$5K – $100K",
+                "deadline": "Rolling",
+            },
+            {
+                "name": "DoraHacks Global Hackathon",
+                "platform": "DoraHacks",
+                "type": "Hackathon",
+                "description": "Ongoing Web3 hackathons with prizes from leading protocols.",
+                "url": "https://dorahacks.io/hackathon",
+                "amount": "Various prizes",
+                "deadline": "Multiple active",
+            },
+            {
+                "name": "Chainlink BUILD Program",
+                "platform": "Chainlink",
+                "type": "Ecosystem Grant",
+                "description": "Access to Chainlink services and co-marketing for early-stage projects.",
+                "url": "https://chain.link/build",
+                "amount": "Services + support",
+                "deadline": "Rolling",
+            },
+        ]
+
+    return grants
+
+
+def format_grants_message(grants: list[dict], title: str = "🏆 Active Web3 Grants & Hackathons") -> str:
+    """Format grants list into a Telegram message."""
+    platform_emoji = {
+        "Gitcoin": "🟢", "DoraHacks": "🔵", "Optimism RPGF": "🔴",
+        "Ethereum Foundation": "🔷", "Uniswap Foundation": "🦄",
+        "Arbitrum": "🔵", "Polygon": "🟣", "Chainlink": "🔗",
+    }
+    lines = [f"{title}\n"]
+    for g in grants[:8]:
+        emoji = platform_emoji.get(g["platform"], "🚀")
+        desc = f"\n   📝 {g['description']}..." if g.get("description") else ""
+        lines.append(
+            f"{emoji} *{g['name']}*\n"
+            f"   🏛️ {g['platform']} | 📋 {g['type']}\n"
+            f"   💰 {g['amount']} | ⏰ {g['deadline']}{desc}\n"
+            f"   🔗 [Apply / Learn More]({g['url']})\n"
+        )
+    lines.append("_Use /alerts to receive new grant announcements daily._")
+    return "\n".join(lines)
+
+
 async def fetch_fundraising_rounds() -> list[dict]:
     """Fetch recent Web3 fundraising rounds from DeFiLlama raises API."""
     rounds = []
@@ -226,9 +382,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("💼 Browse Jobs", callback_data="cmd_jobs"),
          InlineKeyboardButton("🔍 Research Project", callback_data="cmd_research")],
         [InlineKeyboardButton("💰 Fundraising Rounds", callback_data="cmd_fundraising"),
-         InlineKeyboardButton("🔔 Daily Alerts", callback_data="cmd_alerts")],
-        [InlineKeyboardButton("📋 My Applications", callback_data="cmd_applications"),
-         InlineKeyboardButton("⚙️ Preferences", callback_data="cmd_preferences")],
+         InlineKeyboardButton("🏆 Grants & Hackathons", callback_data="cmd_grants")],
+        [InlineKeyboardButton("🔔 Daily Alerts", callback_data="cmd_alerts"),
+         InlineKeyboardButton("📋 My Applications", callback_data="cmd_applications")],
+        [InlineKeyboardButton("⚙️ Preferences", callback_data="cmd_preferences")],
     ]
     markup = InlineKeyboardMarkup(keyboard)
 
@@ -245,7 +402,8 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"/jobs — Browse Web3 job listings\n"
         f"/research `<project>` — Deep-dive any project\n"
         f"/fundraising — Latest VC & fundraising rounds\n"
-        f"/alerts — Toggle daily fundraising & job alerts\n"
+        f"/grants — Active grants & hackathons\n"
+        f"/alerts — Toggle daily alerts\n"
         f"/apply — Log a job application\n"
         f"/applications — View your applications\n"
         f"/update\\_status — Update application status\n"
@@ -361,6 +519,19 @@ async def alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "🔕 *Daily Alerts Disabled.*\n\nUse /alerts to turn them back on anytime.",
             parse_mode="Markdown"
         )
+
+
+async def grants(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    gate = verify_gate(chat_id)
+    if gate:
+        await update.message.reply_text(gate)
+        return
+
+    await update.message.reply_text("⏳ Fetching active grants and hackathons...")
+    grant_list = await fetch_grants()
+    msg = format_grants_message(grant_list)
+    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
 
 
 async def research(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -567,8 +738,11 @@ async def send_daily_alerts(ctx: ContextTypes.DEFAULT_TYPE):
         logger.info("No users opted in to alerts.")
         return
 
-    rounds = await fetch_fundraising_rounds()
-    jobs_list = await fetch_web3_jobs()
+    rounds, jobs_list, grant_list = (
+        await fetch_fundraising_rounds(),
+        await fetch_web3_jobs(),
+        await fetch_grants(),
+    )
     today = datetime.utcnow().strftime("%A, %b %d %Y")
 
     # Fundraising digest (top 5)
@@ -581,9 +755,14 @@ async def send_daily_alerts(ctx: ContextTypes.DEFAULT_TYPE):
     job_lines = ["\n\n💼 *Top New Job Listings*\n"]
     for job in jobs_list[:3]:
         job_lines.append(f"• *{job['title']}* @ {job['company']}\n  🔗 [Apply]({job['url']})")
-    job_lines.append("\n\n_Use /fundraising or /jobs for the full lists._")
 
-    full_msg = fundraising_msg + "\n".join(job_lines)
+    # Top 3 grants
+    grant_lines = ["\n\n🏆 *Active Grants & Hackathons*\n"]
+    for g in grant_list[:3]:
+        grant_lines.append(f"• *{g['name']}* ({g['platform']}) — {g['amount']}\n  🔗 [Details]({g['url']})")
+    grant_lines.append("\n\n_Use /fundraising, /jobs, or /grants for the full lists._")
+
+    full_msg = fundraising_msg + "\n".join(job_lines) + "\n".join(grant_lines)
 
     for chat_id in alert_users:
         try:
@@ -632,6 +811,16 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("⏳ Fetching fundraising rounds...")
             rounds = await fetch_fundraising_rounds()
             msg = format_fundraising_message(rounds)
+            await query.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+
+    elif data == "cmd_grants":
+        gate = verify_gate(chat_id)
+        if gate:
+            await query.message.reply_text(gate)
+        else:
+            await query.message.reply_text("⏳ Fetching active grants and hackathons...")
+            grant_list = await fetch_grants()
+            msg = format_grants_message(grant_list)
             await query.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
 
     elif data == "cmd_alerts":
@@ -749,6 +938,7 @@ def main():
     app.add_handler(CommandHandler("jobs", jobs))
     app.add_handler(CommandHandler("research", research))
     app.add_handler(CommandHandler("fundraising", fundraising))
+    app.add_handler(CommandHandler("grants", grants))
     app.add_handler(CommandHandler("alerts", alerts))
     app.add_handler(CommandHandler("applications", applications))
     app.add_handler(CommandHandler("preferences", preferences))
