@@ -1,1395 +1,477 @@
+import asyncio, aiohttp, json, logging, os, re, sqlite3, hashlib, time
+from datetime import datetime, timedelta
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from dotenv import load_dotenv
+from funding_handlers import funding_stats_handler, twitter_scan_handler, status_handler
+from daily_report import (daily_scheduler, send_daily_report,
+                           project_detail_callback, init_daily_tables)
+
 load_dotenv()
-
-import os
-import logging
-import aiohttp
-import feedparser
-from datetime import datetime, time
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler,
-    MessageHandler, filters, ContextTypes, ConversationHandler
-)
-
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN         = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-SUBSCRIPTION_CODE = os.environ.get("SUBSCRIPTION_CODE", "Pelumi1@")
+SUB_CODE = "Pelumi1@"
+DB_PATH  = os.getenv("DB_PATH","enhanced_fundraising_alerts.db")
 
-# In-memory store (replace with a DB for production)
-# chat_id -> {verified, subscribed, alerts_on, preferences, applications}
-users_db: dict = {}
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS subscribers(
+        chat_id INTEGER PRIMARY KEY, subscribed_at TEXT,
+        subscription_verified BOOLEAN DEFAULT FALSE, verification_code TEXT,
+        stages TEXT DEFAULT "[]", funding_amounts TEXT DEFAULT "[]",
+        include_startups BOOLEAN DEFAULT TRUE,
+        include_small_community BOOLEAN DEFAULT TRUE,
+        include_newly_launched BOOLEAN DEFAULT TRUE,
+        min_followers INTEGER DEFAULT 0, max_followers INTEGER DEFAULT 100000,
+        telegram_communities BOOLEAN DEFAULT TRUE,
+        community_size_filters TEXT DEFAULT "[]")""")
+    c.execute("""CREATE TABLE IF NOT EXISTS user_job_applications(
+        id TEXT PRIMARY KEY, chat_id INTEGER, project_name TEXT,
+        job_title TEXT, platform TEXT, application_date TEXT,
+        status TEXT, job_url TEXT, salary_range TEXT, notes TEXT,
+        follow_up_date TEXT, response_date TEXT, interview_date TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS alerts(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, unique_id TEXT UNIQUE,
+        project_name TEXT, stage TEXT, amount TEXT, description TEXT,
+        source_url TEXT, timestamp TEXT, sent BOOLEAN DEFAULT FALSE)""")
+    conn.commit(); conn.close()
+    init_daily_tables()
 
-# Conversation states
-AWAITING_APPLY_ROLE    = 1
-AWAITING_APPLY_LINK    = 2
-AWAITING_STATUS_UPDATE = 3
-AWAITING_WALLET_ADDR   = 4
-AWAITING_WALLET_LABEL  = 5
-AWAITING_REMOVE_WALLET = 6
+def is_verified(chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("SELECT subscription_verified FROM subscribers WHERE chat_id=?",(chat_id,))
+    row  = c.fetchone(); conn.close()
+    return bool(row and row[0])
 
+def verify_user(chat_id, code):
+    if code.strip() != SUB_CODE: return False
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("""INSERT OR REPLACE INTO subscribers
+        (chat_id,subscribed_at,subscription_verified,verification_code)
+        VALUES(?,?,TRUE,?)""",(chat_id,datetime.now().isoformat(),code))
+    conn.commit(); conn.close(); return True
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+def get_verified_subs():
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("SELECT chat_id FROM subscribers WHERE subscription_verified=TRUE")
+    rows = c.fetchall(); conn.close()
+    return [r[0] for r in rows]
 
-def get_user(chat_id: int) -> dict:
-    if chat_id not in users_db:
-        users_db[chat_id] = {
-            "verified": False,
-            "subscribed": False,
-            "alerts_on": False,
-            "preferences": {"chains": [], "roles": [], "salary_min": 0},
-            "applications": [],
-            "wallets": [],
-        }
-    return users_db[chat_id]
-
-
-def is_verified(chat_id: int) -> bool:
-    return get_user(chat_id).get("verified", False)
-
-
-def verify_gate(chat_id: int) -> str | None:
-    if not is_verified(chat_id):
-        return "🔒 You need to verify first. Use /verify <code> to unlock the bot."
-    return None
-
-
-# ─── Data Fetchers ────────────────────────────────────────────────────────────
-
-async def fetch_web3_jobs() -> list[dict]:
-    """Fetch Web3 jobs from public crypto job boards."""
-    jobs = []
+def add_application(chat_id,app_id,project,title,platform,url,salary="TBD"):
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
     try:
-        async with aiohttp.ClientSession() as session:
-            url = "https://cryptojobslist.com/jobs.json"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    for job in (data if isinstance(data, list) else [])[:15]:
-                        jobs.append({
-                            "title": job.get("title", "Unknown Role"),
-                            "company": job.get("company", "Unknown Company"),
-                            "location": job.get("location", "Remote"),
-                            "url": job.get("url", "https://cryptojobslist.com"),
-                            "tags": job.get("tags", []),
-                        })
-    except Exception as e:
-        logger.warning(f"Job fetch failed: {e}")
+        c.execute("""INSERT INTO user_job_applications
+            (id,chat_id,project_name,job_title,platform,application_date,status,job_url,salary_range)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+            (app_id,chat_id,project,title,platform,datetime.now().isoformat(),"pending",url,salary))
+        conn.commit(); return True
+    except sqlite3.IntegrityError: return False
+    finally: conn.close()
 
-    if not jobs:
-        jobs = [
-            {"title": "Smart Contract Developer", "company": "Aave", "location": "Remote", "url": "https://jobs.lever.co/aave", "tags": ["Solidity", "DeFi"]},
-            {"title": "Web3 Frontend Engineer", "company": "Uniswap", "location": "Remote", "url": "https://jobs.uniswap.org", "tags": ["React", "ethers.js"]},
-            {"title": "DeFi Protocol Engineer", "company": "Compound", "location": "Remote", "url": "https://compound.finance/jobs", "tags": ["DeFi", "Solidity"]},
-            {"title": "Blockchain Researcher", "company": "Messari", "location": "Remote", "url": "https://messari.io/careers", "tags": ["Research", "Crypto"]},
-            {"title": "Token Economics Designer", "company": "Delphi Digital", "location": "Remote", "url": "https://delphidigital.io/careers", "tags": ["Tokenomics", "Research"]},
-            {"title": "NFT Marketplace Developer", "company": "OpenSea", "location": "Remote", "url": "https://opensea.io/careers", "tags": ["NFT", "Marketplace"]},
-            {"title": "DAO Operations Manager", "company": "Gitcoin", "location": "Remote", "url": "https://gitcoin.co/jobs", "tags": ["DAO", "Operations"]},
-            {"title": "Web3 Security Auditor", "company": "Trail of Bits", "location": "Remote", "url": "https://www.trailofbits.com/careers", "tags": ["Security", "Audit"]},
-        ]
-    return jobs
+def get_applications(chat_id):
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("SELECT * FROM user_job_applications WHERE chat_id=? ORDER BY application_date DESC LIMIT 20",(chat_id,))
+    rows = c.fetchall(); conn.close(); return rows
 
+def update_app_status(chat_id,app_id,status,notes=""):
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("UPDATE user_job_applications SET status=?,notes=? WHERE id=? AND chat_id=?",
+              (status,notes,app_id,chat_id))
+    ok = c.rowcount>0; conn.commit(); conn.close(); return ok
 
-async def fetch_grants() -> list[dict]:
-    """Fetch active Web3 grants and hackathons from public sources."""
-    grants = []
+async def guard(update, context):
+    if not is_verified(update.effective_chat.id):
+        await update.message.reply_text(
+            "🔐 Access restricted.\\n\\nUse /verify [code] to unlock.\\n"
+            "Contact admin for your subscription code.")
+        return False
+    return True
 
-    # Gitcoin Grants — active rounds via Grants Stack API
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = "https://grants-stack-indexer-v2.gitcoin.co/graphql"
-            query = """{"query":"{rounds(filter:{strategyName:{equalTo:\\"allov2.DonationVotingMerkleDistributionDirectTransferStrategy\\"},roundMetadata:{isNot:null}},first:10,orderBy:CREATED_AT_BLOCK_DESC){nodes{id chainId roundMetadata applicationMetadata}}}"}"""
-            async with session.post(url, data=query, headers={"Content-Type": "application/json"}, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    nodes = data.get("data", {}).get("rounds", {}).get("nodes", [])
-                    for r in nodes[:5]:
-                        meta = r.get("roundMetadata") or {}
-                        name = meta.get("name", "Gitcoin Round")
-                        desc = (meta.get("description") or "")[:120]
-                        grants.append({
-                            "name": name,
-                            "platform": "Gitcoin",
-                            "type": "Grant Round",
-                            "description": desc,
-                            "url": f"https://explorer.gitcoin.co/#/round/{r.get('chainId','1')}/{r.get('id','')}",
-                            "amount": "Varies",
-                            "deadline": "Active now",
-                        })
-    except Exception as e:
-        logger.warning(f"Gitcoin fetch failed: {e}")
-
-    # DoraHacks — active hackathons via public API
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = "https://dorahacks.io/api/hackathoninformation/?limit=8&offset=0&status=open"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    items = data.get("data", data) if isinstance(data, dict) else data
-                    if isinstance(items, list):
-                        for h in items[:5]:
-                            title = h.get("title") or h.get("name", "DoraHacks Hackathon")
-                            prize = h.get("prize_pool") or h.get("total_prize", "")
-                            prize_str = f"${prize:,}" if isinstance(prize, (int, float)) and prize else str(prize) or "Prize pool available"
-                            slug = h.get("id") or h.get("slug", "")
-                            grants.append({
-                                "name": title,
-                                "platform": "DoraHacks",
-                                "type": "Hackathon",
-                                "description": (h.get("description") or "")[:120],
-                                "url": f"https://dorahacks.io/hackathon/{slug}/detail",
-                                "amount": prize_str,
-                                "deadline": h.get("end_time", "Check site")[:10] if h.get("end_time") else "Check site",
-                            })
-    except Exception as e:
-        logger.warning(f"DoraHacks fetch failed: {e}")
-
-    if not grants:
-        # Curated fallback — real recurring programs
-        grants = [
-            {
-                "name": "Optimism Retroactive Public Goods Funding",
-                "platform": "Optimism RPGF",
-                "type": "Retroactive Grant",
-                "description": "Rewards projects that have created positive impact for the Optimism ecosystem.",
-                "url": "https://app.optimism.io/retropgf",
-                "amount": "Millions OP",
-                "deadline": "Round-based",
-            },
-            {
-                "name": "Ethereum Foundation ESP",
-                "platform": "Ethereum Foundation",
-                "type": "Grant",
-                "description": "Ecosystem Support Program for projects strengthening Ethereum and its ecosystem.",
-                "url": "https://esp.ethereum.foundation",
-                "amount": "Up to $250K",
-                "deadline": "Rolling",
-            },
-            {
-                "name": "Gitcoin Grants Program",
-                "platform": "Gitcoin",
-                "type": "Grant Round",
-                "description": "Quadratic funding rounds for open-source public goods projects.",
-                "url": "https://explorer.gitcoin.co",
-                "amount": "Varies by matching pool",
-                "deadline": "Seasonal rounds",
-            },
-            {
-                "name": "Uniswap Foundation Grants",
-                "platform": "Uniswap Foundation",
-                "type": "Grant",
-                "description": "Funds research, tooling, and community projects for the Uniswap ecosystem.",
-                "url": "https://uniswapfoundation.mirror.xyz",
-                "amount": "$10K – $250K",
-                "deadline": "Rolling",
-            },
-            {
-                "name": "Arbitrum DAO Grants Program",
-                "platform": "Arbitrum",
-                "type": "DAO Grant",
-                "description": "Community grants for builders on Arbitrum One and Arbitrum Nova.",
-                "url": "https://arbitrum.foundation/grants",
-                "amount": "Up to $100K ARB",
-                "deadline": "Rolling",
-            },
-            {
-                "name": "Polygon Village Grants",
-                "platform": "Polygon",
-                "type": "Grant",
-                "description": "Funding for projects building on Polygon PoS, zkEVM, and Miden.",
-                "url": "https://polygon.technology/village/grants",
-                "amount": "$5K – $100K",
-                "deadline": "Rolling",
-            },
-            {
-                "name": "DoraHacks Global Hackathon",
-                "platform": "DoraHacks",
-                "type": "Hackathon",
-                "description": "Ongoing Web3 hackathons with prizes from leading protocols.",
-                "url": "https://dorahacks.io/hackathon",
-                "amount": "Various prizes",
-                "deadline": "Multiple active",
-            },
-            {
-                "name": "Chainlink BUILD Program",
-                "platform": "Chainlink",
-                "type": "Ecosystem Grant",
-                "description": "Access to Chainlink services and co-marketing for early-stage projects.",
-                "url": "https://chain.link/build",
-                "amount": "Services + support",
-                "deadline": "Rolling",
-            },
-        ]
-
-    return grants
-
-
-async def fetch_coin_prices(coins: list[str]) -> dict[str, float]:
-    """Fetch USD prices for a list of CoinGecko IDs."""
-    prices: dict[str, float] = {}
-    if not coins:
-        return prices
-    try:
-        ids = ",".join(coins)
-        async with aiohttp.ClientSession() as session:
-            url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    for coin_id, v in data.items():
-                        prices[coin_id] = v.get("usd", 0.0)
-    except Exception as e:
-        logger.warning(f"CoinGecko price fetch failed: {e}")
-    return prices
-
-
-CHAIN_META = {
-    "eth": {"name": "Ethereum", "coingecko": "ethereum", "decimals": 1e18, "symbol": "ETH",
-            "api": "https://api.blockcypher.com/v1/eth/main/addrs/{addr}/balance"},
-    "btc": {"name": "Bitcoin",  "coingecko": "bitcoin",  "decimals": 1e8,  "symbol": "BTC",
-            "api": "https://api.blockcypher.com/v1/btc/main/addrs/{addr}/balance"},
-    "matic": {"name": "Polygon", "coingecko": "matic-network", "decimals": 1e18, "symbol": "MATIC",
-              "api": None},
-}
-
-ETHERSCAN_KEY = os.environ.get("ETHERSCAN_API_KEY", "")
-
-
-async def fetch_wallet_balance(address: str, chain: str) -> dict:
-    """Fetch native balance for an address using public APIs. Returns balance info dict."""
-    meta = CHAIN_META.get(chain)
-    if not meta:
-        return {"error": f"Unsupported chain: {chain}"}
-
-    native_balance = 0.0
-    tokens: list[dict] = []
-
-    # Native balance via BlockCypher (no API key needed)
-    if meta["api"]:
-        try:
-            url = meta["api"].format(addr=address)
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        d = await resp.json()
-                        satoshis = d.get("balance") or d.get("final_balance") or 0
-                        native_balance = satoshis / meta["decimals"]
-        except Exception as e:
-            logger.warning(f"BlockCypher balance fetch failed for {address}: {e}")
-
-    # ERC-20 token balances via Etherscan (optional, only if key is set)
-    if chain == "eth" and ETHERSCAN_KEY:
-        try:
-            url = (
-                f"https://api.etherscan.io/api?module=account&action=tokentx"
-                f"&address={address}&startblock=0&endblock=99999999"
-                f"&sort=desc&apikey={ETHERSCAN_KEY}"
-            )
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        seen: dict[str, dict] = {}
-                        for tx in (data.get("result") or []):
-                            sym = tx.get("tokenSymbol", "")
-                            if sym and sym not in seen:
-                                dec = int(tx.get("tokenDecimal") or 18)
-                                seen[sym] = {"symbol": sym, "name": tx.get("tokenName", sym),
-                                             "decimals": dec, "contract": tx.get("contractAddress", "")}
-                        tokens = list(seen.values())[:10]
-        except Exception as e:
-            logger.warning(f"Etherscan token fetch failed: {e}")
-
-    # Fetch native price
-    prices = await fetch_coin_prices([meta["coingecko"]])
-    native_price = prices.get(meta["coingecko"], 0.0)
-    native_usd = native_balance * native_price
-
-    return {
-        "chain": chain,
-        "chain_name": meta["name"],
-        "symbol": meta["symbol"],
-        "address": address,
-        "native_balance": native_balance,
-        "native_price": native_price,
-        "native_usd": native_usd,
-        "tokens": tokens,
-    }
-
-
-def format_portfolio_message(wallets_data: list[dict], labels: list[str]) -> str:
-    """Format portfolio data into a Telegram message."""
-    lines = ["📊 *Your Crypto Portfolio*\n"]
-    total_usd = 0.0
-
-    for i, (data, label) in enumerate(zip(wallets_data, labels), 1):
-        if data.get("error"):
-            lines.append(f"*{i}. {label}* — ⚠️ {data['error']}\n")
-            continue
-
-        bal = data["native_balance"]
-        usd = data["native_usd"]
-        price = data["native_price"]
-        total_usd += usd
-        addr_short = data["address"][:6] + "..." + data["address"][-4:]
-
-        lines.append(
-            f"*{i}. {label}* (`{addr_short}`)\n"
-            f"   ⛓️ {data['chain_name']}\n"
-            f"   💎 {bal:.6f} {data['symbol']} @ ${price:,.2f}\n"
-            f"   💵 Value: ${usd:,.2f}\n"
-        )
-
-        if data.get("tokens"):
-            token_names = ", ".join(t["symbol"] for t in data["tokens"][:5])
-            lines.append(f"   🪙 Tokens: {token_names}\n")
-
-    lines.append(f"\n💰 *Total Portfolio Value: ${total_usd:,.2f}*")
-    lines.append("_Balances are read-only — no private keys required._")
-    return "\n".join(lines)
-
-
-def format_grants_message(grants: list[dict], title: str = "🏆 Active Web3 Grants & Hackathons") -> str:
-    """Format grants list into a Telegram message."""
-    platform_emoji = {
-        "Gitcoin": "🟢", "DoraHacks": "🔵", "Optimism RPGF": "🔴",
-        "Ethereum Foundation": "🔷", "Uniswap Foundation": "🦄",
-        "Arbitrum": "🔵", "Polygon": "🟣", "Chainlink": "🔗",
-    }
-    lines = [f"{title}\n"]
-    for g in grants[:8]:
-        emoji = platform_emoji.get(g["platform"], "🚀")
-        desc = f"\n   📝 {g['description']}..." if g.get("description") else ""
-        lines.append(
-            f"{emoji} *{g['name']}*\n"
-            f"   🏛️ {g['platform']} | 📋 {g['type']}\n"
-            f"   💰 {g['amount']} | ⏰ {g['deadline']}{desc}\n"
-            f"   🔗 [Apply / Learn More]({g['url']})\n"
-        )
-    lines.append("_Use /alerts to receive new grant announcements daily._")
-    return "\n".join(lines)
-
-
-NEWS_FEEDS = [
-    {"name": "CoinDesk",  "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
-    {"name": "Decrypt",   "url": "https://decrypt.co/feed"},
-    {"name": "The Block", "url": "https://www.theblock.co/rss.xml"},
-    {"name": "Cointelegraph", "url": "https://cointelegraph.com/rss"},
-]
-
-
-async def fetch_news(limit: int = 12) -> list[dict]:
-    """Fetch latest Web3/crypto headlines from public RSS feeds."""
-    articles: list[dict] = []
-    loop = __import__("asyncio").get_event_loop()
-
-    for feed_meta in NEWS_FEEDS:
-        try:
-            # feedparser is sync — run in executor so it doesn't block the event loop
-            parsed = await loop.run_in_executor(None, feedparser.parse, feed_meta["url"])
-            for entry in parsed.entries[:4]:
-                published = ""
-                if hasattr(entry, "published_parsed") and entry.published_parsed:
-                    published = datetime(*entry.published_parsed[:6]).strftime("%b %d")
-                articles.append({
-                    "title":  entry.get("title", "No title"),
-                    "url":    entry.get("link", ""),
-                    "source": feed_meta["name"],
-                    "date":   published,
-                    "summary": (entry.get("summary") or "")[:120],
-                })
-        except Exception as e:
-            logger.warning(f"RSS fetch failed for {feed_meta['name']}: {e}")
-
-    # Sort by source so it's consistent, cap total
-    return articles[:limit]
-
-
-def format_news_message(articles: list[dict], title: str = "📰 Latest Web3 News") -> str:
-    """Format news articles into a Telegram message."""
-    source_emoji = {
-        "CoinDesk": "🟡", "Decrypt": "🔵", "The Block": "⬛", "Cointelegraph": "🟠",
-    }
-    lines = [f"{title}\n"]
-    for a in articles:
-        emoji = source_emoji.get(a["source"], "📰")
-        date_str = f" · {a['date']}" if a.get("date") else ""
-        lines.append(
-            f"{emoji} *{a['title']}*\n"
-            f"   _{a['source']}{date_str}_\n"
-            f"   🔗 [Read more]({a['url']})\n"
-        )
-    lines.append("_Use /alerts to get headlines delivered daily._")
-    return "\n".join(lines)
-
-
-async def fetch_fundraising_rounds() -> list[dict]:
-    """Fetch recent Web3 fundraising rounds from DeFiLlama raises API."""
-    rounds = []
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = "https://api.llama.fi/raises"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
-                if resp.status == 200:
-                    data = await resp.json(content_type=None)
-                    items = data.get("raises", data) if isinstance(data, dict) else data
-                    # Sort by date descending, take most recent 20
-                    items = sorted(
-                        [r for r in items if isinstance(r, dict)],
-                        key=lambda x: x.get("date", 0),
-                        reverse=True
-                    )[:20]
-                    for r in items:
-                        amount = r.get("amount")
-                        amount_str = f"${amount:,.1f}M" if amount else "Undisclosed"
-                        date_ts = r.get("date")
-                        date_str = datetime.utcfromtimestamp(date_ts).strftime("%b %d, %Y") if date_ts else "Unknown"
-                        rounds.append({
-                            "name": r.get("name", "Unknown Project"),
-                            "amount": amount_str,
-                            "round": r.get("round", "Unknown Round"),
-                            "category": r.get("category", ""),
-                            "chains": r.get("chains", []),
-                            "lead_investors": r.get("leadInvestors", []),
-                            "other_investors": r.get("otherInvestors", []),
-                            "date": date_str,
-                            "source": r.get("source", ""),
-                        })
-    except Exception as e:
-        logger.warning(f"Fundraising fetch failed: {e}")
-
-    if not rounds:
-        # Fallback curated data
-        rounds = [
-            {"name": "Monad Labs", "amount": "$225.0M", "round": "Series A", "category": "L1", "chains": ["Monad"], "lead_investors": ["Paradigm"], "other_investors": ["a16z", "Electric Capital"], "date": "Jan 15, 2025", "source": ""},
-            {"name": "Story Protocol", "amount": "$80.0M", "round": "Series B", "category": "IP", "chains": ["Ethereum"], "lead_investors": ["a16z"], "other_investors": ["Polychain", "Samsung Next"], "date": "Jan 10, 2025", "source": ""},
-            {"name": "Babylon", "amount": "$70.0M", "round": "Series A", "category": "Bitcoin Staking", "chains": ["Bitcoin"], "lead_investors": ["Paradigm"], "other_investors": ["Polychain", "Hack VC"], "date": "Dec 20, 2024", "source": ""},
-            {"name": "Berachain", "amount": "$100.0M", "round": "Series B", "category": "L1", "chains": ["Berachain"], "lead_investors": ["Framework Ventures"], "other_investors": ["OKX Ventures", "Brevan Howard"], "date": "Dec 14, 2024", "source": ""},
-            {"name": "EigenLayer", "amount": "$100.0M", "round": "Series B", "category": "Restaking", "chains": ["Ethereum"], "lead_investors": ["Andreessen Horowitz"], "other_investors": ["Polychain", "Electric Capital"], "date": "Nov 28, 2024", "source": ""},
-            {"name": "Farcaster", "amount": "$150.0M", "round": "Series A", "category": "Social", "chains": ["Optimism", "Base"], "lead_investors": ["Paradigm"], "other_investors": ["a16z", "Haun Ventures"], "date": "Nov 15, 2024", "source": ""},
-        ]
-    return rounds
-
-
-async def research_project(project: str) -> str:
-    """Pull project info from CoinGecko or DefiLlama."""
-    result_lines = [f"🔍 *Research: {project}*\n"]
-    slug = project.lower().replace(" ", "-")
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"https://api.coingecko.com/api/v3/coins/{slug}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    d = await resp.json()
-                    desc = (d.get("description", {}).get("en", "") or "")[:300]
-                    mc = d.get("market_data", {}).get("market_cap", {}).get("usd")
-                    price = d.get("market_data", {}).get("current_price", {}).get("usd")
-                    result_lines.append(f"📌 *{d.get('name', project)}* ({d.get('symbol','').upper()})")
-                    if price:
-                        result_lines.append(f"💵 Price: ${price:,.4f}")
-                    if mc:
-                        result_lines.append(f"📊 Market Cap: ${mc:,.0f}")
-                    if desc:
-                        result_lines.append(f"\n📝 {desc}...")
-                    links = d.get("links", {})
-                    if links.get("homepage") and links["homepage"][0]:
-                        result_lines.append(f"🌐 Website: {links['homepage'][0]}")
-                    if links.get("twitter_screen_name"):
-                        result_lines.append(f"🐦 Twitter: @{links['twitter_screen_name']}")
-                    return "\n".join(result_lines)
-    except Exception as e:
-        logger.warning(f"CoinGecko lookup failed: {e}")
-
-    try:
-        async with aiohttp.ClientSession() as session:
-            url = f"https://api.llama.fi/protocol/{slug}"
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status == 200:
-                    d = await resp.json()
-                    tvl = d.get("tvl")
-                    category = d.get("category", "DeFi")
-                    result_lines.append(f"📌 *{d.get('name', project)}* — {category}")
-                    if tvl and isinstance(tvl, list) and tvl:
-                        result_lines.append(f"💰 TVL: ${tvl[-1].get('totalLiquidityUSD', 0):,.0f}")
-                    chains = d.get("chains", [])
-                    if chains:
-                        result_lines.append(f"⛓️ Chains: {', '.join(chains[:5])}")
-                    return "\n".join(result_lines)
-    except Exception as e:
-        logger.warning(f"DefiLlama lookup failed: {e}")
-
-    return f"⚠️ Could not find data for *{project}*. Try the exact token slug (e.g. `bitcoin`, `ethereum`, `uniswap`)."
-
-
-def format_fundraising_message(rounds: list[dict], title: str = "💰 Recent Web3 Fundraising Rounds") -> str:
-    """Format a list of fundraising rounds into a Telegram message."""
-    lines = [f"{title}\n"]
-    category_emoji = {
-        "L1": "⛓️", "L2": "🔵", "DeFi": "🏦", "NFT": "🖼️",
-        "Gaming": "🎮", "DAO": "🗳️", "Infrastructure": "🔧",
-        "Social": "💬", "Restaking": "🔄", "Bitcoin": "🟠",
-        "IP": "💡", "Security": "🛡️",
-    }
-    for r in rounds[:10]:
-        cat = r.get("category", "")
-        emoji = category_emoji.get(cat, "🚀")
-        lead = ", ".join(r.get("lead_investors", [])[:2]) or "Undisclosed"
-        chains = ", ".join(r.get("chains", [])[:3])
-        chain_str = f" | ⛓️ {chains}" if chains else ""
-        source_str = f"\n   🔗 [Source]({r['source']})" if r.get("source") else ""
-        lines.append(
-            f"{emoji} *{r['name']}* — {r['amount']}\n"
-            f"   📋 {r['round']} | 🗓️ {r['date']}{chain_str}\n"
-            f"   🏦 Lead: {lead}{source_str}\n"
-        )
-    lines.append("_Use /alerts to get these delivered daily._")
-    return "\n".join(lines)
-
-
-# ─── Command Handlers ─────────────────────────────────────────────────────────
-
-async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    chat_id = update.effective_chat.id
+# ── /start ────────────────────────────────────────────────────────
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id  = update.effective_chat.id
     verified = is_verified(chat_id)
-
-    keyboard = [
-        [InlineKeyboardButton("🔑 Verify Access", callback_data="cmd_verify")],
-        [InlineKeyboardButton("💼 Browse Jobs", callback_data="cmd_jobs"),
-         InlineKeyboardButton("🔍 Research Project", callback_data="cmd_research")],
-        [InlineKeyboardButton("💰 Fundraising Rounds", callback_data="cmd_fundraising"),
-         InlineKeyboardButton("🏆 Grants & Hackathons", callback_data="cmd_grants")],
-        [InlineKeyboardButton("📰 News", callback_data="cmd_news"),
-         InlineKeyboardButton("📊 Portfolio", callback_data="cmd_portfolio")],
-        [InlineKeyboardButton("🔔 Daily Alerts", callback_data="cmd_alerts"),
-         InlineKeyboardButton("📋 My Applications", callback_data="cmd_applications")],
-        [InlineKeyboardButton("⚙️ Preferences", callback_data="cmd_preferences")],
-    ]
-    markup = InlineKeyboardMarkup(keyboard)
-
-    status = "✅ Verified" if verified else "🔒 Not Verified"
-    alerts_status = "🔔 On" if get_user(chat_id).get("alerts_on") else "🔕 Off"
-    msg = (
-        f"👋 Welcome, *{user.first_name}*!\n\n"
-        f"🤖 *Web3 Career & Fundraising Bot*\n"
-        f"Status: {status} | Alerts: {alerts_status}\n\n"
-        f"I help you find Web3 jobs, research crypto projects, track applications, "
-        f"and monitor VC fundraising rounds.\n\n"
-        f"*Commands:*\n"
-        f"/verify `<code>` — Unlock full access\n"
-        f"/news — Latest Web3 headlines\n"
-        f"/jobs — Browse Web3 job listings\n"
-        f"/research `<project>` — Deep-dive any project\n"
-        f"/fundraising — Latest VC & fundraising rounds\n"
-        f"/grants — Active grants & hackathons\n"
-        f"/portfolio — View crypto wallet balances & P&L\n"
-        f"/addwallet `<addr> <chain>` — Track a wallet\n"
-        f"/removewallet — Remove a tracked wallet\n"
-        f"/alerts — Toggle daily alerts\n"
-        f"/apply — Log a job application\n"
-        f"/applications — View your applications\n"
-        f"/update\\_status — Update application status\n"
-        f"/preferences — Set your job preferences\n"
-        f"/subscribe — Subscription info\n"
-    )
-    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=markup)
-
-
-async def verify_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    args = ctx.args
-
-    if not args:
+    if not verified:
         await update.message.reply_text(
-            "🔑 Enter your subscription code:\n`/verify <code>`\n\nDon't have one? Use `/subscribe`",
-            parse_mode="Markdown"
-        )
-        return
-
-    code = " ".join(args).strip()
-    if code == SUBSCRIPTION_CODE:
-        get_user(chat_id)["verified"] = True
-        await update.message.reply_text(
-            "✅ *Access Granted!*\n\nYou now have full access to the Web3 Career Bot.\n\n"
-            "Try:\n• /jobs — browse live listings\n• /fundraising — latest VC rounds\n"
-            "• /alerts — turn on daily alerts\n• /research ethereum — research any project",
-            parse_mode="Markdown"
-        )
+            "🚀 Web3 Career & Intelligence Bot\\n\\n"
+            "🔐 Premium access required.\\n\\n"
+            "Step 1: Get your code from the admin\\n"
+            "Step 2: /verify [your_code]\\n"
+            "Step 3: Full access unlocked!\\n\\n"
+            "📞 @PelumiAdmin for access")
     else:
         await update.message.reply_text(
-            "❌ Invalid code. Check your code and try again.\n"
-            "Need a subscription? Use `/subscribe`",
-            parse_mode="Markdown"
-        )
+            "🚀 Web3 Career Bot — FULL ACCESS ✅\\n\\n"
+            "📅 DAILY REPORTS (auto every morning)\\n"
+            "  /daily_report — run report right now\\n"
+            "  /set_report_time — change report time\\n\\n"
+            "📊 LIVE SCANS\\n"
+            "  /funding_stats — live funding news\\n"
+            "  /twitter_scan  — Twitter signals\\n"
+            "  /scout_communities — Telegram scout\\n\\n"
+            "🔍 RESEARCH\\n"
+            "  /research [project] — deep analysis\\n\\n"
+            "💼 JOBS & APPLICATIONS\\n"
+            "  /jobs — latest listings\\n"
+            "  /apply /applications /update_status\\n\\n"
+            "⚙️ SETTINGS\\n"
+            "  /preferences /status /weekly_report")
 
-
-async def subscribe(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    get_user(chat_id)["subscribed"] = True
-    await update.message.reply_text(
-        "📬 *Subscription*\n\n"
-        "To get full access, use the subscription code:\n\n"
-        "`/verify Pelumi1@`\n\n"
-        "Once verified, use /alerts to enable daily Web3 job alerts and fundraising round notifications.",
-        parse_mode="Markdown"
-    )
-
-
-async def jobs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return
-
-    await update.message.reply_text("⏳ Fetching latest Web3 jobs...")
-    job_list = await fetch_web3_jobs()
-
-    prefs = get_user(chat_id).get("preferences", {})
-    preferred_roles = [r.lower() for r in prefs.get("roles", [])]
-
-    lines = ["💼 *Latest Web3 Jobs*\n"]
-    for i, job in enumerate(job_list[:10], 1):
-        title = job["title"]
-        company = job["company"]
-        location = job["location"]
-        url = job["url"]
-        tags = ", ".join(job.get("tags", [])[:3])
-        match = "⭐ " if any(r in title.lower() for r in preferred_roles) else ""
-        lines.append(f"{match}*{i}. {title}*\n🏢 {company} | 📍 {location}\n🏷️ {tags}\n🔗 [Apply]({url})\n")
-
-    lines.append("_Use /apply to log when you apply to a role._")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
-
-
-async def fundraising(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return
-
-    await update.message.reply_text("⏳ Fetching latest fundraising rounds...")
-    rounds = await fetch_fundraising_rounds()
-    msg = format_fundraising_message(rounds)
-    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
-
-
-async def alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return
-
-    user = get_user(chat_id)
-    current = user.get("alerts_on", False)
-    user["alerts_on"] = not current
-
-    if user["alerts_on"]:
+# ── /verify ───────────────────────────────────────────────────────
+async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /verify [code]"); return
+    if verify_user(update.effective_chat.id, " ".join(context.args)):
         await update.message.reply_text(
-            "🔔 *Daily Alerts Enabled!*\n\n"
-            "You'll receive a daily digest at *9:00 AM UTC* with:\n"
-            "• 💰 Latest Web3 fundraising rounds\n"
-            "• 💼 Top new job listings\n"
-            "• 📈 Notable market moves\n\n"
-            "Use /alerts again to turn off.",
-            parse_mode="Markdown"
-        )
+            "✅ ACCESS GRANTED! Welcome 🚀\\n\\n"
+            "Your daily morning intelligence report starts tomorrow.\\n"
+            "Or run /daily_report right now for today's data!")
     else:
-        await update.message.reply_text(
-            "🔕 *Daily Alerts Disabled.*\n\nUse /alerts to turn them back on anytime.",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text("❌ Invalid code. Contact @PelumiAdmin")
 
-
-async def portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return
-
-    wallets = get_user(chat_id).get("wallets", [])
-    if not wallets:
-        await update.message.reply_text(
-            "📊 *Your Portfolio is Empty*\n\n"
-            "Use /addwallet to track a crypto wallet.\n\n"
-            "Supported chains: `eth` (Ethereum), `btc` (Bitcoin), `matic` (Polygon)\n\n"
-            "Example: `/addwallet 0xAbC...123 eth My Main Wallet`",
-            parse_mode="Markdown"
-        )
-        return
-
-    await update.message.reply_text(f"⏳ Fetching balances for {len(wallets)} wallet(s)...")
-    wallets_data = []
-    labels = []
-    for w in wallets:
-        data = await fetch_wallet_balance(w["address"], w["chain"])
-        wallets_data.append(data)
-        labels.append(w.get("label", w["address"][:10]))
-
-    msg = format_portfolio_message(wallets_data, labels)
-    keyboard = [[
-        InlineKeyboardButton("➕ Add Wallet", callback_data="portfolio_add"),
-        InlineKeyboardButton("❌ Remove Wallet", callback_data="portfolio_remove"),
-    ]]
-    await update.message.reply_text(
-        msg, parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-
-
-async def addwallet_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return ConversationHandler.END
-
-    args = ctx.args
-    # Quick path: /addwallet <address> <chain> [label...]
-    if args and len(args) >= 2:
-        address = args[0].strip()
-        chain = args[1].lower().strip()
-        label = " ".join(args[2:]) if len(args) > 2 else address[:10] + "..."
-        if chain not in CHAIN_META:
-            await update.message.reply_text(
-                f"❌ Unsupported chain `{chain}`.\nSupported: `eth`, `btc`, `matic`",
-                parse_mode="Markdown"
-            )
-            return ConversationHandler.END
-        wallets = get_user(chat_id).get("wallets", [])
-        if any(w["address"].lower() == address.lower() for w in wallets):
-            await update.message.reply_text("⚠️ That wallet is already tracked.")
-            return ConversationHandler.END
-        wallets.append({"address": address, "chain": chain, "label": label})
-        await update.message.reply_text(
-            f"✅ *Wallet Added!*\n\n🏷️ {label}\n⛓️ Chain: {CHAIN_META[chain]['name']}\n"
-            f"📍 `{address}`\n\nUse /portfolio to see your balances.",
-            parse_mode="Markdown"
-        )
-        return ConversationHandler.END
-
-    await update.message.reply_text(
-        "➕ *Add a Wallet*\n\n"
-        "Paste your wallet address:\n_(ETH, BTC, or MATIC — read-only, no private key needed)_",
-        parse_mode="Markdown"
-    )
-    return AWAITING_WALLET_ADDR
-
-
-async def addwallet_addr_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["new_wallet_addr"] = update.message.text.strip()
-    keyboard = [[
-        InlineKeyboardButton("Ethereum (ETH)", callback_data="chain_eth"),
-        InlineKeyboardButton("Bitcoin (BTC)", callback_data="chain_btc"),
-    ], [
-        InlineKeyboardButton("Polygon (MATIC)", callback_data="chain_matic"),
-    ]]
-    await update.message.reply_text(
-        "⛓️ Which chain is this wallet on?",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
-    return AWAITING_WALLET_LABEL
-
-
-async def addwallet_label_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    label = update.message.text.strip()
-    address = ctx.user_data.get("new_wallet_addr", "")
-    chain = ctx.user_data.get("new_wallet_chain", "eth")
-    wallets = get_user(chat_id).get("wallets", [])
-    wallets.append({"address": address, "chain": chain, "label": label})
-    await update.message.reply_text(
-        f"✅ *Wallet Added!*\n\n🏷️ {label}\n⛓️ {CHAIN_META[chain]['name']}\n"
-        f"📍 `{address}`\n\nUse /portfolio to see your balance.",
-        parse_mode="Markdown"
-    )
-    ctx.user_data.pop("new_wallet_addr", None)
-    ctx.user_data.pop("new_wallet_chain", None)
-    return ConversationHandler.END
-
-
-async def removewallet_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return ConversationHandler.END
-
-    wallets = get_user(chat_id).get("wallets", [])
-    if not wallets:
-        await update.message.reply_text("📭 No wallets to remove. Use /addwallet to add one.")
-        return ConversationHandler.END
-
-    lines = ["❌ *Remove a Wallet*\n\nReply with the number to remove:\n"]
-    for i, w in enumerate(wallets, 1):
-        lines.append(f"{i}. {w.get('label', '')} — {w['address'][:10]}... ({CHAIN_META.get(w['chain'], {}).get('name', w['chain'])})")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    return AWAITING_REMOVE_WALLET
-
-
-async def removewallet_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+# ── /daily_report — manual trigger ───────────────────────────────
+async def daily_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context): return
+    msg = await update.message.reply_text(
+        "🌅 Starting full intelligence scan...\\n\\n"
+        "📡 Scanning all 20 sources:\\n"
+        "CoinGecko · DexScreener · DexTools\\n"
+        "ICO Drops · CryptoRank · Seedify\\n"
+        "Polkastarter · DAO Maker · PinkSale\\n"
+        "CoinList · Binance Launchpad · Messari\\n"
+        "RSS Feeds · Twitter/X · CoinCarp\\n"
+        "Dune · Nomics · Chain Broker\\n\\n"
+        "⏳ This takes 60-90 seconds. Stand by...")
     try:
-        idx = int(update.message.text.strip()) - 1
-        wallets = get_user(chat_id)["wallets"]
-        if idx < 0 or idx >= len(wallets):
-            raise IndexError
-        removed = wallets.pop(idx)
+        await send_daily_report(context.bot)
+        # Delete loading message since report was sent
+        await context.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=msg.message_id)
+    except Exception as e:
+        logger.error(f"daily_report_cmd: {e}")
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id,
+            message_id=msg.message_id,
+            text=f"❌ Report failed: {e}\\nTry /funding_stats for a quick scan instead.")
+
+# ── /set_report_time ──────────────────────────────────────────────
+async def set_report_time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context): return
+    if not context.args or not context.args[0].isdigit():
         await update.message.reply_text(
-            f"✅ Removed: *{removed.get('label', removed['address'][:12])}*",
-            parse_mode="Markdown"
-        )
-    except (ValueError, IndexError):
-        await update.message.reply_text("❌ Invalid number. Try /removewallet again.")
-    return ConversationHandler.END
-
-
-async def news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
+            "⏰ Set your daily report hour (UTC)\\n\\n"
+            "Usage: /set_report_time [hour]\\n"
+            "Example: /set_report_time 8\\n  (sends at 8:00 AM UTC)\\n\\n"
+            f"Current setting: {os.getenv('DAILY_REPORT_HOUR','8')}:00 UTC\\n\\n"
+            "To change globally, update DAILY_REPORT_HOUR in Railway → Variables")
         return
-
-    await update.message.reply_text("⏳ Fetching latest Web3 headlines...")
-    articles = await fetch_news(limit=12)
-    if not articles:
-        await update.message.reply_text("⚠️ Could not fetch news right now. Try again in a moment.")
-        return
-    msg = format_news_message(articles)
-    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
-
-
-async def grants(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return
-
-    await update.message.reply_text("⏳ Fetching active grants and hackathons...")
-    grant_list = await fetch_grants()
-    msg = format_grants_message(grant_list)
-    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
-
-
-async def research(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return
-
-    args = ctx.args
-    if not args:
-        await update.message.reply_text(
-            "🔍 Which project do you want to research?\n\n"
-            "Usage: `/research <project>`\n"
-            "Example: `/research ethereum` or `/research uniswap`",
-            parse_mode="Markdown"
-        )
-        return
-
-    project = " ".join(args)
-    await update.message.reply_text(f"⏳ Researching *{project}*...", parse_mode="Markdown")
-    result = await research_project(project)
-    await update.message.reply_text(result, parse_mode="Markdown", disable_web_page_preview=True)
-
-
-async def apply_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return ConversationHandler.END
-
+    hour = int(context.args[0])
+    if not 0 <= hour <= 23:
+        await update.message.reply_text("❌ Hour must be 0-23"); return
     await update.message.reply_text(
-        "📝 *Log a Job Application*\n\nWhat role did you apply for?\n\nFormat: `Company — Job Title`\nExample: `Uniswap — Frontend Engineer`",
-        parse_mode="Markdown"
-    )
-    return AWAITING_APPLY_ROLE
+        f"✅ Report time noted: {hour:02d}:00 UTC\\n\\n"
+        f"⚠️ To make it permanent, set DAILY_REPORT_HOUR={hour} in Railway Variables tab.")
 
-
-async def apply_role_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["apply_role"] = update.message.text
+# ── /subscribe ────────────────────────────────────────────────────
+async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context): return
     await update.message.reply_text(
-        "🔗 Paste the job URL (or type `skip` to skip):",
-        parse_mode="Markdown"
-    )
-    return AWAITING_APPLY_LINK
+        "🔔 You are subscribed to daily reports!\\n\\n"
+        "Every morning you will receive:\\n"
+        "• Full scan of all 20 sources\\n"
+        "• Every new project found\\n"
+        "• Risk analysis for each\\n"
+        "• Job opportunities per project\\n"
+        "• Tap-for-detail buttons\\n\\n"
+        "Run /daily_report now to see today's results!")
 
-
-async def apply_link_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    role = ctx.user_data.get("apply_role", "Unknown")
-    link = update.message.text if update.message.text.lower() != "skip" else ""
-
-    application = {
-        "id": len(get_user(chat_id)["applications"]) + 1,
-        "role": role,
-        "url": link,
-        "status": "Applied",
-        "date": datetime.now().strftime("%Y-%m-%d"),
-    }
-    get_user(chat_id)["applications"].append(application)
-
-    await update.message.reply_text(
-        f"✅ *Application Logged!*\n\n"
-        f"📋 Role: {role}\n"
-        f"📅 Date: {application['date']}\n"
-        f"🔄 Status: Applied\n\n"
-        f"View all with /applications",
-        parse_mode="Markdown"
-    )
-    return ConversationHandler.END
-
-
-async def applications(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return
-
-    apps = get_user(chat_id).get("applications", [])
-    if not apps:
-        await update.message.reply_text(
-            "📋 No applications tracked yet.\nUse /apply to log your first application!"
-        )
-        return
-
-    status_emoji = {
-        "Applied": "📤", "Interviewing": "🎤", "Offer": "🎉",
-        "Rejected": "❌", "Withdrawn": "🔙",
-    }
-    lines = [f"📋 *Your Applications ({len(apps)} total)*\n"]
-    for app in apps[-10:]:
-        emoji = status_emoji.get(app["status"], "📋")
-        url_part = f"\n   🔗 [Link]({app['url']})" if app.get("url") else ""
-        lines.append(
-            f"{emoji} *{app['role']}*\n"
-            f"   📅 {app['date']} | Status: {app['status']}{url_part}\n"
-        )
-
-    lines.append("\n_Use /update\\_status to update a status._")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
-
-
-async def update_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return ConversationHandler.END
-
-    apps = get_user(chat_id).get("applications", [])
-    if not apps:
-        await update.message.reply_text("📋 No applications to update. Use /apply first.")
-        return ConversationHandler.END
-
-    lines = [
-        "🔄 *Update Application Status*\n\n"
-        "Reply with: `<number> <status>`\n\n"
-        "Statuses: Applied, Interviewing, Offer, Rejected, Withdrawn\n\n"
-        "*Your applications:*\n"
-    ]
-    for app in apps:
-        lines.append(f"{app['id']}. {app['role']} — {app['status']}")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    return AWAITING_STATUS_UPDATE
-
-
-async def status_update_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    text = update.message.text.strip()
-    valid_statuses = ["Applied", "Interviewing", "Offer", "Rejected", "Withdrawn"]
-
-    try:
-        parts = text.split(None, 1)
-        app_id = int(parts[0])
-        new_status = parts[1].strip().title() if len(parts) > 1 else ""
-        if new_status not in valid_statuses:
-            raise ValueError("Invalid status")
-
-        apps = get_user(chat_id)["applications"]
-        app = next((a for a in apps if a["id"] == app_id), None)
-        if not app:
-            await update.message.reply_text("❌ Application not found. Check the number.")
-            return ConversationHandler.END
-
-        old_status = app["status"]
-        app["status"] = new_status
-        await update.message.reply_text(
-            f"✅ Updated!\n\n*{app['role']}*\n{old_status} → {new_status}",
-            parse_mode="Markdown"
-        )
-    except Exception:
-        await update.message.reply_text(
-            f"❌ Invalid format. Try: `1 Interviewing`\nValid statuses: {', '.join(valid_statuses)}",
-            parse_mode="Markdown"
-        )
-    return ConversationHandler.END
-
-
-async def preferences(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    gate = verify_gate(chat_id)
-    if gate:
-        await update.message.reply_text(gate)
-        return
-
-    prefs = get_user(chat_id)["preferences"]
+# ── /preferences ─────────────────────────────────────────────────
+async def preferences_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context): return
     keyboard = [
-        [InlineKeyboardButton("👨‍💻 Set Roles", callback_data="pref_roles"),
-         InlineKeyboardButton("⛓️ Set Chains", callback_data="pref_chains")],
-        [InlineKeyboardButton("💰 Set Min Salary", callback_data="pref_salary")],
+        [InlineKeyboardButton("🎯 Project Stages",     callback_data="pref_stages")],
+        [InlineKeyboardButton("💰 Funding Amounts",    callback_data="pref_amounts")],
+        [InlineKeyboardButton("👥 Community Settings", callback_data="pref_community")],
+        [InlineKeyboardButton("📊 View Current",       callback_data="pref_view")],
     ]
-    markup = InlineKeyboardMarkup(keyboard)
-
-    chains = ", ".join(prefs.get("chains", [])) or "None set"
-    roles = ", ".join(prefs.get("roles", [])) or "None set"
-    salary = f"${prefs.get('salary_min', 0):,}" if prefs.get("salary_min") else "Not set"
-
     await update.message.reply_text(
-        f"⚙️ *Your Preferences*\n\n"
-        f"👨‍💻 Roles: {roles}\n"
-        f"⛓️ Chains: {chains}\n"
-        f"💰 Min Salary: {salary}\n\n"
-        f"Update below:",
-        parse_mode="Markdown",
-        reply_markup=markup
-    )
+        "⚙️ PREFERENCES\\nChoose what to configure:",
+        reply_markup=InlineKeyboardMarkup(keyboard))
 
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.data.startswith("proj:"):
+        await project_detail_callback(update, context); return
+    await q.answer()
+    if q.data == "pref_view":
+        await q.edit_message_text("📊 Use /status for full settings overview.")
+    else:
+        await q.edit_message_text(f"⚙️ Use /preferences to reconfigure settings.\\n{q.data}")
 
-# ─── Scheduled Daily Alert Job ────────────────────────────────────────────────
+# ── /research ─────────────────────────────────────────────────────
+async def research_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context): return
+    if not context.args:
+        await update.message.reply_text("Usage: /research [project name]"); return
+    project = " ".join(context.args)
+    msg     = await update.message.reply_text(
+        f"🔍 Researching {project}...\\n⏳ 30-60 seconds...")
+    try:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15),
+            headers={"User-Agent":"Mozilla/5.0"}
+        ) as s:
+            async with s.get(
+                f"https://api.coingecko.com/api/v3/search?query={project}") as r:
+                if r.status != 200: raise Exception("CoinGecko unavailable")
+                data  = await r.json()
+                coins = data.get("coins",[])
+            if not coins:
+                await context.bot.edit_message_text(
+                    chat_id=update.effective_chat.id, message_id=msg.message_id,
+                    text=(f"🔍 Research: {project}\\n\\n"
+                          "Not found on CoinGecko — may be very early stage.\\n\\n"
+                          "Try /daily_report to see all newly discovered projects."))
+                return
+            cid = coins[0]["id"]
+            async with s.get(
+                f"https://api.coingecko.com/api/v3/coins/{cid}",
+                params={"localization":"false","tickers":"false",
+                        "community_data":"true","developer_data":"true"}) as dr:
+                d = await dr.json()
+            links  = d.get("links",{})
+            mkt    = d.get("market_data",{})
+            name   = d.get("name","Unknown")
+            desc   = (d.get("description",{}).get("en","") or "")[:500]
+            web    = (links.get("homepage",["N/A"])[0] or "N/A").rstrip("/")
+            tw     = f"@{links.get('twitter_screen_name','N/A')}"
+            tg     = links.get("telegram_channel_identifier","N/A")
+            gh     = (links.get("repos_url",{}).get("github",["N/A"])[0] or "N/A")
+            mcap   = mkt.get("market_cap",{}).get("usd",0) or 0
+            price  = mkt.get("current_price",{}).get("usd",0) or 0
+            change = mkt.get("price_change_percentage_24h",0) or 0
+            await context.bot.edit_message_text(
+                chat_id=update.effective_chat.id, message_id=msg.message_id,
+                text=(f"📊 RESEARCH: {name.upper()}\\n{'━'*30}\\n\\n"
+                      f"📋 {desc[:400]}\\n\\n"
+                      f"{'━'*30}\\n📱 SOCIALS\\n"
+                      f"  🌐 {web}\\n  🐦 {tw}\\n"
+                      f"  📱 Telegram: {tg}\\n  💻 GitHub: {gh}\\n\\n"
+                      f"{'━'*30}\\n💰 MARKET\\n"
+                      f"  Price: ${price:,.6f}\\n"
+                      f"  Market Cap: ${mcap:,.0f}\\n"
+                      f"  24h Change: {change:.1f}%\\n\\n"
+                      f"💡 /jobs for roles in this space"),
+                disable_web_page_preview=True)
+    except Exception as e:
+        logger.error(f"research: {e}")
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id, message_id=msg.message_id,
+            text=f"❌ Research failed: {e}\\nTry again shortly.")
 
-async def send_daily_alerts(ctx: ContextTypes.DEFAULT_TYPE):
-    """Runs daily at 9:00 AM UTC — sends fundraising + job digest to opted-in users."""
-    logger.info("Running daily alert broadcast...")
-
-    alert_users = [
-        cid for cid, u in users_db.items()
-        if u.get("verified") and u.get("alerts_on")
+# ── /jobs ─────────────────────────────────────────────────────────
+async def jobs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context): return
+    msg = await update.message.reply_text(
+        "💼 Fetching live Web3 jobs...\\n"
+        "🏆 Superteam Earn · ₿ CryptoJobsList · 🌐 Web3.career\\n⏳ 30s...")
+    fallback = [
+        {"p":"🏆 Superteam","t":"Community Manager","c":"Web3 Project","s":"$500–3000","u":"https://earn.superteam.fun"},
+        {"p":"₿ CryptoJobsList","t":"Social Media Manager","c":"DeFi Protocol","s":"$1000–4000","u":"https://cryptojobslist.com"},
+        {"p":"🌐 Web3.career","t":"Business Development","c":"NFT Platform","s":"$2000–8000","u":"https://web3.career"},
     ]
+    try:
+        real = []
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12),
+                                          headers={"User-Agent":"Mozilla/5.0"}) as s:
+            try:
+                async with s.get("https://earn.superteam.fun/api/listings?limit=5") as r:
+                    if r.status == 200:
+                        data = await r.json()
+                        for item in (data.get("listings") or data if isinstance(data,list) else [])[:5]:
+                            real.append({
+                                "p":"🏆 Superteam Earn",
+                                "t":item.get("title","Unknown"),
+                                "c":item.get("sponsor",{}).get("name","Unknown") if isinstance(item.get("sponsor"),dict) else "Unknown",
+                                "s":f"${item.get('rewardAmount',0):,}" if item.get("rewardAmount") else "See listing",
+                                "u":f"https://earn.superteam.fun/listings/{item.get('slug','')}"})
+            except: pass
+        jobs = real if real else fallback
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id, message_id=msg.message_id,
+            text=f"💼 LIVE WEB3 JOBS\\n{'─'*28}\\n{len(jobs)} opportunities found\\n\\nTrack: /apply [url] [company] [title]")
+        for i,j in enumerate(jobs,1):
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                disable_web_page_preview=True,
+                text=(f"#{i} {j['p']}\\n📌 {j['t']}\\n🏢 {j['c']}\\n💰 {j['s']}\\n🔗 {j['u']}\\n"
+                      f"Track: /apply {j['u']} {j['c'].replace(' ','_')} {j['t'].replace(' ','_')}"))
+            await asyncio.sleep(0.4)
+    except Exception as e:
+        logger.error(f"jobs: {e}")
+        await context.bot.edit_message_text(
+            chat_id=update.effective_chat.id, message_id=msg.message_id,
+            text=f"❌ Jobs fetch failed: {e}")
 
-    if not alert_users:
-        logger.info("No users opted in to alerts.")
-        return
+# ── /apply ────────────────────────────────────────────────────────
+async def apply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context): return
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "📝 /apply [url] [company] [title]\\n\\nExample:\\n"
+            "/apply https://earn.superteam.fun Chainlink Community_Manager"); return
+    chat_id  = update.effective_chat.id
+    url      = context.args[0]
+    company  = context.args[1].replace("_"," ")
+    title    = " ".join(context.args[2:]).replace("_"," ")
+    platform = ("superteam_earn" if "superteam" in url else
+                "crypto_jobs"   if "cryptojobs" in url else "direct")
+    app_id   = hashlib.md5(f"{chat_id}{url}{int(time.time())}".encode()).hexdigest()[:8]
+    if add_application(chat_id,app_id,company,title,platform,url):
+        await update.message.reply_text(
+            f"✅ Application Tracked!\\n📌 {title}\\n🏢 {company}\\n"
+            f"🆔 {app_id}\\n📊 Status: Pending\\n\\n"
+            f"Update: /update_status {app_id} applied\\nView all: /applications")
+    else:
+        await update.message.reply_text("❌ Error. Try again.")
 
-    rounds, jobs_list, grant_list, articles = (
-        await fetch_fundraising_rounds(),
-        await fetch_web3_jobs(),
-        await fetch_grants(),
-        await fetch_news(limit=4),
-    )
-    today = datetime.utcnow().strftime("%A, %b %d %Y")
-
-    # Fundraising digest (top 5)
-    fundraising_msg = format_fundraising_message(
-        rounds[:5],
-        title=f"📅 *Daily Web3 Digest — {today}*\n\n💰 *Latest Fundraising Rounds*"
-    )
-
-    # Top 3 jobs
-    job_lines = ["\n\n💼 *Top New Job Listings*\n"]
-    for job in jobs_list[:3]:
-        job_lines.append(f"• *{job['title']}* @ {job['company']}\n  🔗 [Apply]({job['url']})")
-
-    # Top 3 grants
-    grant_lines = ["\n\n🏆 *Active Grants & Hackathons*\n"]
-    for g in grant_list[:3]:
-        grant_lines.append(f"• *{g['name']}* ({g['platform']}) — {g['amount']}\n  🔗 [Details]({g['url']})")
-
-    # Top 4 news headlines
-    news_lines = ["\n\n📰 *Top Headlines*\n"]
-    source_emoji = {"CoinDesk": "🟡", "Decrypt": "🔵", "The Block": "⬛", "Cointelegraph": "🟠"}
-    for a in articles[:4]:
-        emoji = source_emoji.get(a["source"], "📰")
-        news_lines.append(f"{emoji} [{a['title']}]({a['url']}) _{a['source']}_")
-    news_lines.append("\n\n_Use /news, /fundraising, /jobs, or /grants for the full lists._")
-
-    full_msg = fundraising_msg + "\n".join(job_lines) + "\n".join(grant_lines) + "\n".join(news_lines)
-
-    for chat_id in alert_users:
-        try:
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=full_msg,
-                parse_mode="Markdown",
-                disable_web_page_preview=True
-            )
-            logger.info(f"Alert sent to {chat_id}")
-        except Exception as e:
-            logger.warning(f"Failed to send alert to {chat_id}: {e}")
-
-
-# ─── Callback Query Handler ───────────────────────────────────────────────────
-
-async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    chat_id = query.message.chat_id
-
-    if data == "cmd_verify":
-        await query.message.reply_text("Use: `/verify <your-code>`\nExample: `/verify Pelumi1@`", parse_mode="Markdown")
-
-    elif data == "cmd_jobs":
-        gate = verify_gate(chat_id)
-        if gate:
-            await query.message.reply_text(gate)
-        else:
-            await query.message.reply_text("⏳ Fetching jobs...")
-            job_list = await fetch_web3_jobs()
-            lines = ["💼 *Latest Web3 Jobs*\n"]
-            for i, job in enumerate(job_list[:8], 1):
-                lines.append(f"*{i}. {job['title']}*\n🏢 {job['company']} | 📍 {job['location']}\n🔗 [Apply]({job['url']})\n")
-            await query.message.reply_text("\n".join(lines), parse_mode="Markdown", disable_web_page_preview=True)
-
-    elif data == "cmd_research":
-        await query.message.reply_text("Use: `/research <project-name>`\nExample: `/research ethereum`", parse_mode="Markdown")
-
-    elif data == "cmd_news":
-        gate = verify_gate(chat_id)
-        if gate:
-            await query.message.reply_text(gate)
-        else:
-            await query.message.reply_text("⏳ Fetching latest Web3 headlines...")
-            articles = await fetch_news(limit=8)
-            if articles:
-                await query.message.reply_text(
-                    format_news_message(articles), parse_mode="Markdown", disable_web_page_preview=True
-                )
-            else:
-                await query.message.reply_text("⚠️ Could not fetch news right now. Try again shortly.")
-
-    elif data == "cmd_fundraising":
-        gate = verify_gate(chat_id)
-        if gate:
-            await query.message.reply_text(gate)
-        else:
-            await query.message.reply_text("⏳ Fetching fundraising rounds...")
-            rounds = await fetch_fundraising_rounds()
-            msg = format_fundraising_message(rounds)
-            await query.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
-
-    elif data == "cmd_grants":
-        gate = verify_gate(chat_id)
-        if gate:
-            await query.message.reply_text(gate)
-        else:
-            await query.message.reply_text("⏳ Fetching active grants and hackathons...")
-            grant_list = await fetch_grants()
-            msg = format_grants_message(grant_list)
-            await query.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
-
-    elif data == "cmd_portfolio":
-        gate = verify_gate(chat_id)
-        if gate:
-            await query.message.reply_text(gate)
-        else:
-            wallets = get_user(chat_id).get("wallets", [])
-            if not wallets:
-                await query.message.reply_text(
-                    "📊 No wallets tracked yet.\n\n"
-                    "Use /addwallet to add one.\nExample: `/addwallet 0xAbC...123 eth Main Wallet`",
-                    parse_mode="Markdown"
-                )
-            else:
-                await query.message.reply_text(f"⏳ Fetching balances for {len(wallets)} wallet(s)...")
-                wallets_data = [await fetch_wallet_balance(w["address"], w["chain"]) for w in wallets]
-                labels = [w.get("label", w["address"][:10]) for w in wallets]
-                await query.message.reply_text(
-                    format_portfolio_message(wallets_data, labels),
-                    parse_mode="Markdown"
-                )
-
-    elif data == "portfolio_add":
-        await query.message.reply_text(
-            "➕ Use: `/addwallet <address> <chain> [label]`\n\n"
-            "Example: `/addwallet 0xAbC...123 eth My Main Wallet`\n"
-            "Chains: `eth`, `btc`, `matic`",
-            parse_mode="Markdown"
-        )
-
-    elif data == "portfolio_remove":
-        await query.message.reply_text("Use /removewallet to remove a tracked wallet.")
-
-    elif data.startswith("chain_"):
-        chain = data.replace("chain_", "")
-        if chain in CHAIN_META:
-            ctx.user_data["new_wallet_chain"] = chain
-            await query.message.reply_text(
-                f"⛓️ Chain set to *{CHAIN_META[chain]['name']}*.\n\nNow give this wallet a label (e.g. `Main ETH`, `Cold Storage`):",
-                parse_mode="Markdown"
-            )
-
-    elif data == "cmd_alerts":
-        gate = verify_gate(chat_id)
-        if gate:
-            await query.message.reply_text(gate)
-        else:
-            user = get_user(chat_id)
-            user["alerts_on"] = not user.get("alerts_on", False)
-            status = "🔔 enabled" if user["alerts_on"] else "🔕 disabled"
-            await query.message.reply_text(
-                f"Daily alerts {status}!\n\n"
-                + ("You'll get a digest every day at 9:00 AM UTC with fundraising rounds and new job listings." if user["alerts_on"] else "Use /alerts to re-enable.")
-            )
-
-    elif data == "cmd_applications":
-        apps = get_user(chat_id).get("applications", [])
-        if not apps:
-            await query.message.reply_text("📋 No applications yet. Use /apply to log one!")
-        else:
-            lines = [f"📋 *{len(apps)} Applications Tracked*\n"]
-            for app in apps[-5:]:
-                lines.append(f"• {app['role']} — {app['status']} ({app['date']})")
-            await query.message.reply_text("\n".join(lines), parse_mode="Markdown")
-
-    elif data == "cmd_preferences":
-        await query.message.reply_text("Use /preferences to set your job search preferences.")
-
-    elif data == "pref_roles":
-        await query.message.reply_text(
-            "👨‍💻 Reply with your preferred roles (comma-separated):\n"
-            "Example: `Smart Contract Developer, DeFi Researcher, Frontend Engineer`",
-            parse_mode="Markdown"
-        )
-        ctx.user_data["setting_pref"] = "roles"
-
-    elif data == "pref_chains":
-        await query.message.reply_text(
-            "⛓️ Reply with your preferred chains (comma-separated):\n"
-            "Example: `Ethereum, Solana, Polygon, Arbitrum`",
-            parse_mode="Markdown"
-        )
-        ctx.user_data["setting_pref"] = "chains"
-
-    elif data == "pref_salary":
-        await query.message.reply_text(
-            "💰 Reply with your minimum annual salary (USD):\n"
-            "Example: `80000`",
-            parse_mode="Markdown"
-        )
-        ctx.user_data["setting_pref"] = "salary"
-
-
-async def pref_text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ── /applications ─────────────────────────────────────────────────
+async def applications_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context): return
     chat_id = update.effective_chat.id
-    setting = ctx.user_data.get("setting_pref")
-    if not setting:
-        return
+    rows    = get_applications(chat_id)
+    if not rows:
+        await update.message.reply_text("📋 No applications yet.\\nBrowse /jobs then /apply"); return
+    total = len(rows)
+    stats = {}
+    for r in rows: stats[r[6]] = stats.get(r[6],0)+1
+    resp = stats.get("response_received",0)
+    ints = stats.get("interview_scheduled",0)
+    await update.message.reply_text(
+        f"📊 JOB PIPELINE\\n{'━'*24}\\n"
+        f"Total: {total}  Applied: {stats.get('applied',0)}\\n"
+        f"Responses: {resp} ({f'{(resp/total)*100:.0f}%' if total else 'N/A'})\\n"
+        f"Interviews: {ints}  Accepted: {stats.get('accepted',0)}\\n\\n"
+        f"{'━'*24}\\nRECENT APPLICATIONS")
+    icons = {"pending":"⏳","applied":"📤","response_received":"📬",
+             "interview_scheduled":"📅","rejected":"❌","accepted":"🎉"}
+    for row in rows[:8]:
+        icon = icons.get(row[6],"❓")
+        days = (datetime.now()-datetime.fromisoformat(row[5])).days
+        await context.bot.send_message(chat_id=chat_id, disable_web_page_preview=True,
+            text=(f"{icon} {row[3]}\\n🏢 {row[2]}\\n"
+                  f"📅 {days}d ago · 🆔 {row[0]}\\n"
+                  f"📊 {row[6].replace('_',' ').title()}\\n🔗 {row[7]}\\n"
+                  f"Update: /update_status {row[0]} [status]"))
+        await asyncio.sleep(0.3)
 
-    text = update.message.text.strip()
-    prefs = get_user(chat_id)["preferences"]
+# ── /update_status ────────────────────────────────────────────────
+async def update_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context): return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /update_status [app_id] [status]\\n\\n"
+            "Statuses: pending applied response interview rejected accepted withdrawn"); return
+    chat_id = update.effective_chat.id
+    app_id  = context.args[0]
+    status  = {"response":"response_received","interview":"interview_scheduled"}.get(
+               context.args[1].lower(), context.args[1].lower())
+    notes   = " ".join(context.args[2:])
+    if update_app_status(chat_id, app_id, status, notes):
+        extra = {"accepted":"🎊 CONGRATULATIONS!","interview_scheduled":"💪 Good luck!",
+                 "rejected":"💪 Keep going!"}.get(status,"")
+        await update.message.reply_text(
+            f"✅ Updated\\n🆔 {app_id}\\n📊 {status.replace('_',' ').title()}\\n{extra}\\n\\n/applications")
+    else:
+        await update.message.reply_text("❌ ID not found. Check /applications")
 
-    if setting == "roles":
-        prefs["roles"] = [r.strip() for r in text.split(",") if r.strip()]
-        await update.message.reply_text(f"✅ Roles updated: {', '.join(prefs['roles'])}")
-    elif setting == "chains":
-        prefs["chains"] = [c.strip() for c in text.split(",") if c.strip()]
-        await update.message.reply_text(f"✅ Chains updated: {', '.join(prefs['chains'])}")
-    elif setting == "salary":
-        try:
-            prefs["salary_min"] = int(text.replace(",", "").replace("$", ""))
-            await update.message.reply_text(f"✅ Minimum salary set: ${prefs['salary_min']:,}")
-        except ValueError:
-            await update.message.reply_text("❌ Please enter a number, e.g. `80000`", parse_mode="Markdown")
+# ── /weekly_report ────────────────────────────────────────────────
+async def weekly_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context): return
+    chat_id  = update.effective_chat.id
+    rows     = get_applications(chat_id)
+    total    = len(rows)
+    week_ago = datetime.now() - timedelta(days=7)
+    new_week = sum(1 for r in rows if datetime.fromisoformat(r[5]) > week_ago)
+    # Get last report stats
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    log_row = conn.execute(
+        "SELECT * FROM daily_report_log ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    log_txt = ""
+    if log_row:
+        log_txt = (f"\\n📡 Last Report: {log_row['report_date']}\\n"
+                   f"  Sources: {log_row['sources_checked']}  "
+                   f"Projects: {log_row['projects_found']}")
+    await update.message.reply_text(
+        f"📅 WEEKLY REPORT — {datetime.now().strftime('%B %d, %Y')}\\n{'━'*30}\\n\\n"
+        f"💼 New applications this week: {new_week}\\n"
+        f"📊 Total pipeline: {total}\\n"
+        f"{log_txt}\\n\\n"
+        f"🔍 /daily_report — full today's scan\\n"
+        f"💼 /jobs — new opportunities\\n"
+        f"📊 /applications — manage pipeline")
 
-    ctx.user_data.pop("setting_pref", None)
+# ── /scout_communities ────────────────────────────────────────────
+async def scout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update, context): return
+    await update.message.reply_text(
+        "🔭 Telegram Community Scanner\\n\\n"
+        "Requires TELEGRAM_API_ID + TELEGRAM_API_HASH in Railway Variables.\\n\\n"
+        "Once set, scans for communities with 1-200 members and analyses each one "
+        "for legitimacy, team, tokenomics and job gaps.")
 
-
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ Cancelled.")
-    return ConversationHandler.END
-
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
-
+# ── MAIN ──────────────────────────────────────────────────────────
 def main():
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN is not set. Add it to your .env file.")
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logger.error("TELEGRAM_BOT_TOKEN not set"); return
+    init_db()
+    app = Application.builder().token(token).build()
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    for cmd, handler in [
+        ("start",             start_cmd),
+        ("verify",            verify_cmd),
+        ("subscribe",         subscribe_cmd),
+        ("unsubscribe",       subscribe_cmd),
+        ("preferences",       preferences_cmd),
+        ("status",            status_handler),
+        ("research",          research_cmd),
+        ("funding_stats",     funding_stats_handler),
+        ("twitter_scan",      twitter_scan_handler),
+        ("daily_report",      daily_report_cmd),
+        ("set_report_time",   set_report_time_cmd),
+        ("scout_communities", scout_cmd),
+        ("scout",             scout_cmd),
+        ("jobs",              jobs_cmd),
+        ("superteam",         jobs_cmd),
+        ("apply",             apply_cmd),
+        ("applications",      applications_cmd),
+        ("pipeline",          applications_cmd),
+        ("update_status",     update_status_cmd),
+        ("weekly_report",     weekly_report_cmd),
+    ]:
+        app.add_handler(CommandHandler(cmd, handler))
 
-    # Conversation: log a job application
-    apply_conv = ConversationHandler(
-        entry_points=[CommandHandler("apply", apply_command)],
-        states={
-            AWAITING_APPLY_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, apply_role_received)],
-            AWAITING_APPLY_LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, apply_link_received)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
-    # Conversation: update application status
-    status_conv = ConversationHandler(
-        entry_points=[CommandHandler("update_status", update_status)],
-        states={
-            AWAITING_STATUS_UPDATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, status_update_received)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
+    async def post_init(application):
+        asyncio.create_task(daily_scheduler(application.bot))
+        logger.info("Daily scheduler started")
 
-    # Commands
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("verify", verify_command))
-    app.add_handler(CommandHandler("subscribe", subscribe))
-    app.add_handler(CommandHandler("jobs", jobs))
-    app.add_handler(CommandHandler("research", research))
-    app.add_handler(CommandHandler("news", news))
-    app.add_handler(CommandHandler("fundraising", fundraising))
-    app.add_handler(CommandHandler("grants", grants))
-    app.add_handler(CommandHandler("portfolio", portfolio))
-    app.add_handler(CommandHandler("alerts", alerts))
-    app.add_handler(CommandHandler("applications", applications))
-    app.add_handler(CommandHandler("preferences", preferences))
-    app.add_handler(apply_conv)
-    app.add_handler(status_conv)
-
-    # Wallet conversation handlers
-    addwallet_conv = ConversationHandler(
-        entry_points=[CommandHandler("addwallet", addwallet_command)],
-        states={
-            AWAITING_WALLET_ADDR:  [MessageHandler(filters.TEXT & ~filters.COMMAND, addwallet_addr_received)],
-            AWAITING_WALLET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, addwallet_label_received)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    removewallet_conv = ConversationHandler(
-        entry_points=[CommandHandler("removewallet", removewallet_command)],
-        states={
-            AWAITING_REMOVE_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, removewallet_received)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-    )
-    app.add_handler(addwallet_conv)
-    app.add_handler(removewallet_conv)
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pref_text_handler))
-
-    # Schedule daily digest at 09:00 UTC
-    app.job_queue.run_daily(
-        send_daily_alerts,
-        time=time(hour=9, minute=0, second=0),
-        name="daily_alerts",
-    )
-
-    logger.info("Bot is running... Daily alerts scheduled at 09:00 UTC.")
+    app.post_init = post_init
+    logger.info("Bot starting with daily intelligence engine...")
     app.run_polling(drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()
