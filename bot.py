@@ -25,9 +25,12 @@ SUBSCRIPTION_CODE = os.environ.get("SUBSCRIPTION_CODE", "Pelumi1@")
 users_db: dict = {}
 
 # Conversation states
-AWAITING_APPLY_ROLE   = 1
-AWAITING_APPLY_LINK   = 2
+AWAITING_APPLY_ROLE    = 1
+AWAITING_APPLY_LINK    = 2
 AWAITING_STATUS_UPDATE = 3
+AWAITING_WALLET_ADDR   = 4
+AWAITING_WALLET_LABEL  = 5
+AWAITING_REMOVE_WALLET = 6
 
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -40,6 +43,7 @@ def get_user(chat_id: int) -> dict:
             "alerts_on": False,
             "preferences": {"chains": [], "roles": [], "salary_min": 0},
             "applications": [],
+            "wallets": [],
         }
     return users_db[chat_id]
 
@@ -225,6 +229,131 @@ async def fetch_grants() -> list[dict]:
     return grants
 
 
+async def fetch_coin_prices(coins: list[str]) -> dict[str, float]:
+    """Fetch USD prices for a list of CoinGecko IDs."""
+    prices: dict[str, float] = {}
+    if not coins:
+        return prices
+    try:
+        ids = ",".join(coins)
+        async with aiohttp.ClientSession() as session:
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    for coin_id, v in data.items():
+                        prices[coin_id] = v.get("usd", 0.0)
+    except Exception as e:
+        logger.warning(f"CoinGecko price fetch failed: {e}")
+    return prices
+
+
+CHAIN_META = {
+    "eth": {"name": "Ethereum", "coingecko": "ethereum", "decimals": 1e18, "symbol": "ETH",
+            "api": "https://api.blockcypher.com/v1/eth/main/addrs/{addr}/balance"},
+    "btc": {"name": "Bitcoin",  "coingecko": "bitcoin",  "decimals": 1e8,  "symbol": "BTC",
+            "api": "https://api.blockcypher.com/v1/btc/main/addrs/{addr}/balance"},
+    "matic": {"name": "Polygon", "coingecko": "matic-network", "decimals": 1e18, "symbol": "MATIC",
+              "api": None},
+}
+
+ETHERSCAN_KEY = os.environ.get("ETHERSCAN_API_KEY", "")
+
+
+async def fetch_wallet_balance(address: str, chain: str) -> dict:
+    """Fetch native balance for an address using public APIs. Returns balance info dict."""
+    meta = CHAIN_META.get(chain)
+    if not meta:
+        return {"error": f"Unsupported chain: {chain}"}
+
+    native_balance = 0.0
+    tokens: list[dict] = []
+
+    # Native balance via BlockCypher (no API key needed)
+    if meta["api"]:
+        try:
+            url = meta["api"].format(addr=address)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        d = await resp.json()
+                        satoshis = d.get("balance") or d.get("final_balance") or 0
+                        native_balance = satoshis / meta["decimals"]
+        except Exception as e:
+            logger.warning(f"BlockCypher balance fetch failed for {address}: {e}")
+
+    # ERC-20 token balances via Etherscan (optional, only if key is set)
+    if chain == "eth" and ETHERSCAN_KEY:
+        try:
+            url = (
+                f"https://api.etherscan.io/api?module=account&action=tokentx"
+                f"&address={address}&startblock=0&endblock=99999999"
+                f"&sort=desc&apikey={ETHERSCAN_KEY}"
+            )
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        seen: dict[str, dict] = {}
+                        for tx in (data.get("result") or []):
+                            sym = tx.get("tokenSymbol", "")
+                            if sym and sym not in seen:
+                                dec = int(tx.get("tokenDecimal") or 18)
+                                seen[sym] = {"symbol": sym, "name": tx.get("tokenName", sym),
+                                             "decimals": dec, "contract": tx.get("contractAddress", "")}
+                        tokens = list(seen.values())[:10]
+        except Exception as e:
+            logger.warning(f"Etherscan token fetch failed: {e}")
+
+    # Fetch native price
+    prices = await fetch_coin_prices([meta["coingecko"]])
+    native_price = prices.get(meta["coingecko"], 0.0)
+    native_usd = native_balance * native_price
+
+    return {
+        "chain": chain,
+        "chain_name": meta["name"],
+        "symbol": meta["symbol"],
+        "address": address,
+        "native_balance": native_balance,
+        "native_price": native_price,
+        "native_usd": native_usd,
+        "tokens": tokens,
+    }
+
+
+def format_portfolio_message(wallets_data: list[dict], labels: list[str]) -> str:
+    """Format portfolio data into a Telegram message."""
+    lines = ["📊 *Your Crypto Portfolio*\n"]
+    total_usd = 0.0
+
+    for i, (data, label) in enumerate(zip(wallets_data, labels), 1):
+        if data.get("error"):
+            lines.append(f"*{i}. {label}* — ⚠️ {data['error']}\n")
+            continue
+
+        bal = data["native_balance"]
+        usd = data["native_usd"]
+        price = data["native_price"]
+        total_usd += usd
+        addr_short = data["address"][:6] + "..." + data["address"][-4:]
+
+        lines.append(
+            f"*{i}. {label}* (`{addr_short}`)\n"
+            f"   ⛓️ {data['chain_name']}\n"
+            f"   💎 {bal:.6f} {data['symbol']} @ ${price:,.2f}\n"
+            f"   💵 Value: ${usd:,.2f}\n"
+        )
+
+        if data.get("tokens"):
+            token_names = ", ".join(t["symbol"] for t in data["tokens"][:5])
+            lines.append(f"   🪙 Tokens: {token_names}\n")
+
+    lines.append(f"\n💰 *Total Portfolio Value: ${total_usd:,.2f}*")
+    lines.append("_Balances are read-only — no private keys required._")
+    return "\n".join(lines)
+
+
 def format_grants_message(grants: list[dict], title: str = "🏆 Active Web3 Grants & Hackathons") -> str:
     """Format grants list into a Telegram message."""
     platform_emoji = {
@@ -383,9 +512,10 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🔍 Research Project", callback_data="cmd_research")],
         [InlineKeyboardButton("💰 Fundraising Rounds", callback_data="cmd_fundraising"),
          InlineKeyboardButton("🏆 Grants & Hackathons", callback_data="cmd_grants")],
-        [InlineKeyboardButton("🔔 Daily Alerts", callback_data="cmd_alerts"),
-         InlineKeyboardButton("📋 My Applications", callback_data="cmd_applications")],
-        [InlineKeyboardButton("⚙️ Preferences", callback_data="cmd_preferences")],
+        [InlineKeyboardButton("📊 Portfolio", callback_data="cmd_portfolio"),
+         InlineKeyboardButton("🔔 Daily Alerts", callback_data="cmd_alerts")],
+        [InlineKeyboardButton("📋 My Applications", callback_data="cmd_applications"),
+         InlineKeyboardButton("⚙️ Preferences", callback_data="cmd_preferences")],
     ]
     markup = InlineKeyboardMarkup(keyboard)
 
@@ -403,6 +533,9 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"/research `<project>` — Deep-dive any project\n"
         f"/fundraising — Latest VC & fundraising rounds\n"
         f"/grants — Active grants & hackathons\n"
+        f"/portfolio — View crypto wallet balances & P&L\n"
+        f"/addwallet `<addr> <chain>` — Track a wallet\n"
+        f"/removewallet — Remove a tracked wallet\n"
         f"/alerts — Toggle daily alerts\n"
         f"/apply — Log a job application\n"
         f"/applications — View your applications\n"
@@ -519,6 +652,150 @@ async def alerts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "🔕 *Daily Alerts Disabled.*\n\nUse /alerts to turn them back on anytime.",
             parse_mode="Markdown"
         )
+
+
+async def portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    gate = verify_gate(chat_id)
+    if gate:
+        await update.message.reply_text(gate)
+        return
+
+    wallets = get_user(chat_id).get("wallets", [])
+    if not wallets:
+        await update.message.reply_text(
+            "📊 *Your Portfolio is Empty*\n\n"
+            "Use /addwallet to track a crypto wallet.\n\n"
+            "Supported chains: `eth` (Ethereum), `btc` (Bitcoin), `matic` (Polygon)\n\n"
+            "Example: `/addwallet 0xAbC...123 eth My Main Wallet`",
+            parse_mode="Markdown"
+        )
+        return
+
+    await update.message.reply_text(f"⏳ Fetching balances for {len(wallets)} wallet(s)...")
+    wallets_data = []
+    labels = []
+    for w in wallets:
+        data = await fetch_wallet_balance(w["address"], w["chain"])
+        wallets_data.append(data)
+        labels.append(w.get("label", w["address"][:10]))
+
+    msg = format_portfolio_message(wallets_data, labels)
+    keyboard = [[
+        InlineKeyboardButton("➕ Add Wallet", callback_data="portfolio_add"),
+        InlineKeyboardButton("❌ Remove Wallet", callback_data="portfolio_remove"),
+    ]]
+    await update.message.reply_text(
+        msg, parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def addwallet_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    gate = verify_gate(chat_id)
+    if gate:
+        await update.message.reply_text(gate)
+        return ConversationHandler.END
+
+    args = ctx.args
+    # Quick path: /addwallet <address> <chain> [label...]
+    if args and len(args) >= 2:
+        address = args[0].strip()
+        chain = args[1].lower().strip()
+        label = " ".join(args[2:]) if len(args) > 2 else address[:10] + "..."
+        if chain not in CHAIN_META:
+            await update.message.reply_text(
+                f"❌ Unsupported chain `{chain}`.\nSupported: `eth`, `btc`, `matic`",
+                parse_mode="Markdown"
+            )
+            return ConversationHandler.END
+        wallets = get_user(chat_id).get("wallets", [])
+        if any(w["address"].lower() == address.lower() for w in wallets):
+            await update.message.reply_text("⚠️ That wallet is already tracked.")
+            return ConversationHandler.END
+        wallets.append({"address": address, "chain": chain, "label": label})
+        await update.message.reply_text(
+            f"✅ *Wallet Added!*\n\n🏷️ {label}\n⛓️ Chain: {CHAIN_META[chain]['name']}\n"
+            f"📍 `{address}`\n\nUse /portfolio to see your balances.",
+            parse_mode="Markdown"
+        )
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "➕ *Add a Wallet*\n\n"
+        "Paste your wallet address:\n_(ETH, BTC, or MATIC — read-only, no private key needed)_",
+        parse_mode="Markdown"
+    )
+    return AWAITING_WALLET_ADDR
+
+
+async def addwallet_addr_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["new_wallet_addr"] = update.message.text.strip()
+    keyboard = [[
+        InlineKeyboardButton("Ethereum (ETH)", callback_data="chain_eth"),
+        InlineKeyboardButton("Bitcoin (BTC)", callback_data="chain_btc"),
+    ], [
+        InlineKeyboardButton("Polygon (MATIC)", callback_data="chain_matic"),
+    ]]
+    await update.message.reply_text(
+        "⛓️ Which chain is this wallet on?",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return AWAITING_WALLET_LABEL
+
+
+async def addwallet_label_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    label = update.message.text.strip()
+    address = ctx.user_data.get("new_wallet_addr", "")
+    chain = ctx.user_data.get("new_wallet_chain", "eth")
+    wallets = get_user(chat_id).get("wallets", [])
+    wallets.append({"address": address, "chain": chain, "label": label})
+    await update.message.reply_text(
+        f"✅ *Wallet Added!*\n\n🏷️ {label}\n⛓️ {CHAIN_META[chain]['name']}\n"
+        f"📍 `{address}`\n\nUse /portfolio to see your balance.",
+        parse_mode="Markdown"
+    )
+    ctx.user_data.pop("new_wallet_addr", None)
+    ctx.user_data.pop("new_wallet_chain", None)
+    return ConversationHandler.END
+
+
+async def removewallet_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    gate = verify_gate(chat_id)
+    if gate:
+        await update.message.reply_text(gate)
+        return ConversationHandler.END
+
+    wallets = get_user(chat_id).get("wallets", [])
+    if not wallets:
+        await update.message.reply_text("📭 No wallets to remove. Use /addwallet to add one.")
+        return ConversationHandler.END
+
+    lines = ["❌ *Remove a Wallet*\n\nReply with the number to remove:\n"]
+    for i, w in enumerate(wallets, 1):
+        lines.append(f"{i}. {w.get('label', '')} — {w['address'][:10]}... ({CHAIN_META.get(w['chain'], {}).get('name', w['chain'])})")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return AWAITING_REMOVE_WALLET
+
+
+async def removewallet_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    try:
+        idx = int(update.message.text.strip()) - 1
+        wallets = get_user(chat_id)["wallets"]
+        if idx < 0 or idx >= len(wallets):
+            raise IndexError
+        removed = wallets.pop(idx)
+        await update.message.reply_text(
+            f"✅ Removed: *{removed.get('label', removed['address'][:12])}*",
+            parse_mode="Markdown"
+        )
+    except (ValueError, IndexError):
+        await update.message.reply_text("❌ Invalid number. Try /removewallet again.")
+    return ConversationHandler.END
 
 
 async def grants(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -823,6 +1100,47 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             msg = format_grants_message(grant_list)
             await query.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
 
+    elif data == "cmd_portfolio":
+        gate = verify_gate(chat_id)
+        if gate:
+            await query.message.reply_text(gate)
+        else:
+            wallets = get_user(chat_id).get("wallets", [])
+            if not wallets:
+                await query.message.reply_text(
+                    "📊 No wallets tracked yet.\n\n"
+                    "Use /addwallet to add one.\nExample: `/addwallet 0xAbC...123 eth Main Wallet`",
+                    parse_mode="Markdown"
+                )
+            else:
+                await query.message.reply_text(f"⏳ Fetching balances for {len(wallets)} wallet(s)...")
+                wallets_data = [await fetch_wallet_balance(w["address"], w["chain"]) for w in wallets]
+                labels = [w.get("label", w["address"][:10]) for w in wallets]
+                await query.message.reply_text(
+                    format_portfolio_message(wallets_data, labels),
+                    parse_mode="Markdown"
+                )
+
+    elif data == "portfolio_add":
+        await query.message.reply_text(
+            "➕ Use: `/addwallet <address> <chain> [label]`\n\n"
+            "Example: `/addwallet 0xAbC...123 eth My Main Wallet`\n"
+            "Chains: `eth`, `btc`, `matic`",
+            parse_mode="Markdown"
+        )
+
+    elif data == "portfolio_remove":
+        await query.message.reply_text("Use /removewallet to remove a tracked wallet.")
+
+    elif data.startswith("chain_"):
+        chain = data.replace("chain_", "")
+        if chain in CHAIN_META:
+            ctx.user_data["new_wallet_chain"] = chain
+            await query.message.reply_text(
+                f"⛓️ Chain set to *{CHAIN_META[chain]['name']}*.\n\nNow give this wallet a label (e.g. `Main ETH`, `Cold Storage`):",
+                parse_mode="Markdown"
+            )
+
     elif data == "cmd_alerts":
         gate = verify_gate(chat_id)
         if gate:
@@ -939,11 +1257,31 @@ def main():
     app.add_handler(CommandHandler("research", research))
     app.add_handler(CommandHandler("fundraising", fundraising))
     app.add_handler(CommandHandler("grants", grants))
+    app.add_handler(CommandHandler("portfolio", portfolio))
     app.add_handler(CommandHandler("alerts", alerts))
     app.add_handler(CommandHandler("applications", applications))
     app.add_handler(CommandHandler("preferences", preferences))
     app.add_handler(apply_conv)
     app.add_handler(status_conv)
+
+    # Wallet conversation handlers
+    addwallet_conv = ConversationHandler(
+        entry_points=[CommandHandler("addwallet", addwallet_command)],
+        states={
+            AWAITING_WALLET_ADDR:  [MessageHandler(filters.TEXT & ~filters.COMMAND, addwallet_addr_received)],
+            AWAITING_WALLET_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, addwallet_label_received)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    removewallet_conv = ConversationHandler(
+        entry_points=[CommandHandler("removewallet", removewallet_command)],
+        states={
+            AWAITING_REMOVE_WALLET: [MessageHandler(filters.TEXT & ~filters.COMMAND, removewallet_received)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    app.add_handler(addwallet_conv)
+    app.add_handler(removewallet_conv)
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, pref_text_handler))
 
