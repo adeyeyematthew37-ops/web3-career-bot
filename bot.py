@@ -4,8 +4,7 @@ from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from dotenv import load_dotenv
 from funding_handlers import (funding_stats_handler, twitter_scan_handler,
-                              status_handler, scout_communities_handler,
-                              weekly_report_handler)
+                              status_handler, scout_communities_handler)
 from daily_report import (daily_scheduler, send_daily_report,
                            project_detail_callback, init_daily_tables)
 
@@ -425,13 +424,6 @@ async def weekly_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📊 /applications — manage pipeline")
 
 # ── /scout_communities ────────────────────────────────────────────
-async def scout_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await guard(update, context): return
-    await update.message.reply_text(
-        "🔭 Telegram Community Scanner\\n\\n"
-        "Requires TELEGRAM_API_ID + TELEGRAM_API_HASH in Railway Variables.\\n\\n"
-        "Once set, scans for communities with 1-200 members and analyses each one "
-        "for legitimacy, team, tokenomics and job gaps.")
 
 # ── MAIN ──────────────────────────────────────────────────────────
 def main():
