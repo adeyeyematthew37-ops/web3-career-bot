@@ -4,6 +4,7 @@ load_dotenv()
 import os
 import logging
 import aiohttp
+import feedparser
 from datetime import datetime, time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -375,6 +376,59 @@ def format_grants_message(grants: list[dict], title: str = "🏆 Active Web3 Gra
     return "\n".join(lines)
 
 
+NEWS_FEEDS = [
+    {"name": "CoinDesk",  "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
+    {"name": "Decrypt",   "url": "https://decrypt.co/feed"},
+    {"name": "The Block", "url": "https://www.theblock.co/rss.xml"},
+    {"name": "Cointelegraph", "url": "https://cointelegraph.com/rss"},
+]
+
+
+async def fetch_news(limit: int = 12) -> list[dict]:
+    """Fetch latest Web3/crypto headlines from public RSS feeds."""
+    articles: list[dict] = []
+    loop = __import__("asyncio").get_event_loop()
+
+    for feed_meta in NEWS_FEEDS:
+        try:
+            # feedparser is sync — run in executor so it doesn't block the event loop
+            parsed = await loop.run_in_executor(None, feedparser.parse, feed_meta["url"])
+            for entry in parsed.entries[:4]:
+                published = ""
+                if hasattr(entry, "published_parsed") and entry.published_parsed:
+                    published = datetime(*entry.published_parsed[:6]).strftime("%b %d")
+                articles.append({
+                    "title":  entry.get("title", "No title"),
+                    "url":    entry.get("link", ""),
+                    "source": feed_meta["name"],
+                    "date":   published,
+                    "summary": (entry.get("summary") or "")[:120],
+                })
+        except Exception as e:
+            logger.warning(f"RSS fetch failed for {feed_meta['name']}: {e}")
+
+    # Sort by source so it's consistent, cap total
+    return articles[:limit]
+
+
+def format_news_message(articles: list[dict], title: str = "📰 Latest Web3 News") -> str:
+    """Format news articles into a Telegram message."""
+    source_emoji = {
+        "CoinDesk": "🟡", "Decrypt": "🔵", "The Block": "⬛", "Cointelegraph": "🟠",
+    }
+    lines = [f"{title}\n"]
+    for a in articles:
+        emoji = source_emoji.get(a["source"], "📰")
+        date_str = f" · {a['date']}" if a.get("date") else ""
+        lines.append(
+            f"{emoji} *{a['title']}*\n"
+            f"   _{a['source']}{date_str}_\n"
+            f"   🔗 [Read more]({a['url']})\n"
+        )
+    lines.append("_Use /alerts to get headlines delivered daily._")
+    return "\n".join(lines)
+
+
 async def fetch_fundraising_rounds() -> list[dict]:
     """Fetch recent Web3 fundraising rounds from DeFiLlama raises API."""
     rounds = []
@@ -512,10 +566,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
          InlineKeyboardButton("🔍 Research Project", callback_data="cmd_research")],
         [InlineKeyboardButton("💰 Fundraising Rounds", callback_data="cmd_fundraising"),
          InlineKeyboardButton("🏆 Grants & Hackathons", callback_data="cmd_grants")],
-        [InlineKeyboardButton("📊 Portfolio", callback_data="cmd_portfolio"),
-         InlineKeyboardButton("🔔 Daily Alerts", callback_data="cmd_alerts")],
-        [InlineKeyboardButton("📋 My Applications", callback_data="cmd_applications"),
-         InlineKeyboardButton("⚙️ Preferences", callback_data="cmd_preferences")],
+        [InlineKeyboardButton("📰 News", callback_data="cmd_news"),
+         InlineKeyboardButton("📊 Portfolio", callback_data="cmd_portfolio")],
+        [InlineKeyboardButton("🔔 Daily Alerts", callback_data="cmd_alerts"),
+         InlineKeyboardButton("📋 My Applications", callback_data="cmd_applications")],
+        [InlineKeyboardButton("⚙️ Preferences", callback_data="cmd_preferences")],
     ]
     markup = InlineKeyboardMarkup(keyboard)
 
@@ -529,6 +584,7 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"and monitor VC fundraising rounds.\n\n"
         f"*Commands:*\n"
         f"/verify `<code>` — Unlock full access\n"
+        f"/news — Latest Web3 headlines\n"
         f"/jobs — Browse Web3 job listings\n"
         f"/research `<project>` — Deep-dive any project\n"
         f"/fundraising — Latest VC & fundraising rounds\n"
@@ -798,6 +854,22 @@ async def removewallet_received(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+async def news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    gate = verify_gate(chat_id)
+    if gate:
+        await update.message.reply_text(gate)
+        return
+
+    await update.message.reply_text("⏳ Fetching latest Web3 headlines...")
+    articles = await fetch_news(limit=12)
+    if not articles:
+        await update.message.reply_text("⚠️ Could not fetch news right now. Try again in a moment.")
+        return
+    msg = format_news_message(articles)
+    await update.message.reply_text(msg, parse_mode="Markdown", disable_web_page_preview=True)
+
+
 async def grants(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     gate = verify_gate(chat_id)
@@ -1015,10 +1087,11 @@ async def send_daily_alerts(ctx: ContextTypes.DEFAULT_TYPE):
         logger.info("No users opted in to alerts.")
         return
 
-    rounds, jobs_list, grant_list = (
+    rounds, jobs_list, grant_list, articles = (
         await fetch_fundraising_rounds(),
         await fetch_web3_jobs(),
         await fetch_grants(),
+        await fetch_news(limit=4),
     )
     today = datetime.utcnow().strftime("%A, %b %d %Y")
 
@@ -1037,9 +1110,16 @@ async def send_daily_alerts(ctx: ContextTypes.DEFAULT_TYPE):
     grant_lines = ["\n\n🏆 *Active Grants & Hackathons*\n"]
     for g in grant_list[:3]:
         grant_lines.append(f"• *{g['name']}* ({g['platform']}) — {g['amount']}\n  🔗 [Details]({g['url']})")
-    grant_lines.append("\n\n_Use /fundraising, /jobs, or /grants for the full lists._")
 
-    full_msg = fundraising_msg + "\n".join(job_lines) + "\n".join(grant_lines)
+    # Top 4 news headlines
+    news_lines = ["\n\n📰 *Top Headlines*\n"]
+    source_emoji = {"CoinDesk": "🟡", "Decrypt": "🔵", "The Block": "⬛", "Cointelegraph": "🟠"}
+    for a in articles[:4]:
+        emoji = source_emoji.get(a["source"], "📰")
+        news_lines.append(f"{emoji} [{a['title']}]({a['url']}) _{a['source']}_")
+    news_lines.append("\n\n_Use /news, /fundraising, /jobs, or /grants for the full lists._")
+
+    full_msg = fundraising_msg + "\n".join(job_lines) + "\n".join(grant_lines) + "\n".join(news_lines)
 
     for chat_id in alert_users:
         try:
@@ -1079,6 +1159,20 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif data == "cmd_research":
         await query.message.reply_text("Use: `/research <project-name>`\nExample: `/research ethereum`", parse_mode="Markdown")
+
+    elif data == "cmd_news":
+        gate = verify_gate(chat_id)
+        if gate:
+            await query.message.reply_text(gate)
+        else:
+            await query.message.reply_text("⏳ Fetching latest Web3 headlines...")
+            articles = await fetch_news(limit=8)
+            if articles:
+                await query.message.reply_text(
+                    format_news_message(articles), parse_mode="Markdown", disable_web_page_preview=True
+                )
+            else:
+                await query.message.reply_text("⚠️ Could not fetch news right now. Try again shortly.")
 
     elif data == "cmd_fundraising":
         gate = verify_gate(chat_id)
@@ -1255,6 +1349,7 @@ def main():
     app.add_handler(CommandHandler("subscribe", subscribe))
     app.add_handler(CommandHandler("jobs", jobs))
     app.add_handler(CommandHandler("research", research))
+    app.add_handler(CommandHandler("news", news))
     app.add_handler(CommandHandler("fundraising", fundraising))
     app.add_handler(CommandHandler("grants", grants))
     app.add_handler(CommandHandler("portfolio", portfolio))
