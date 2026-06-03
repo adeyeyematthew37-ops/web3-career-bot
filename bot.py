@@ -3,7 +3,9 @@ from datetime import datetime, timedelta
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from dotenv import load_dotenv
-from funding_handlers import funding_stats_handler, twitter_scan_handler, status_handler
+from funding_handlers import (funding_stats_handler, twitter_scan_handler,
+                              status_handler, scout_communities_handler,
+                              weekly_report_handler)
 from daily_report import (daily_scheduler, send_daily_report,
                            project_detail_callback, init_daily_tables)
 
@@ -451,8 +453,8 @@ def main():
         ("twitter_scan",      twitter_scan_handler),
         ("daily_report",      daily_report_cmd),
         ("set_report_time",   set_report_time_cmd),
-        ("scout_communities", scout_cmd),
-        ("scout",             scout_cmd),
+        ("scout_communities", scout_communities_handler),
+        ("scout",             scout_communities_handler),
         ("jobs",              jobs_cmd),
         ("superteam",         jobs_cmd),
         ("apply",             apply_cmd),
