@@ -91,7 +91,7 @@ def update_app_status(chat_id,app_id,status,notes=""):
 async def guard(update, context):
     if not is_verified(update.effective_chat.id):
         await update.message.reply_text(
-            "🔐 Access restricted.\\n\\nUse /verify [code] to unlock.\\n"
+            "🔐 Access restricted.\n\nUse /verify [code] to unlock.\n"
             "Contact admin for your subscription code.")
         return False
     return True
@@ -102,28 +102,28 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     verified = is_verified(chat_id)
     if not verified:
         await update.message.reply_text(
-            "🚀 Web3 Career & Intelligence Bot\\n\\n"
-            "🔐 Premium access required.\\n\\n"
-            "Step 1: Get your code from the admin\\n"
-            "Step 2: /verify [your_code]\\n"
-            "Step 3: Full access unlocked!\\n\\n"
+            "🚀 Web3 Career & Intelligence Bot\n\n"
+            "🔐 Premium access required.\n\n"
+            "Step 1: Get your code from the admin\n"
+            "Step 2: /verify [your_code]\n"
+            "Step 3: Full access unlocked!\n\n"
             "📞 @PelumiAdmin for access")
     else:
         await update.message.reply_text(
-            "🚀 Web3 Career Bot — FULL ACCESS ✅\\n\\n"
-            "📅 DAILY REPORTS (auto every morning)\\n"
-            "  /daily_report — run report right now\\n"
-            "  /set_report_time — change report time\\n\\n"
-            "📊 LIVE SCANS\\n"
-            "  /funding_stats — live funding news\\n"
-            "  /twitter_scan  — Twitter signals\\n"
-            "  /scout_communities — Telegram scout\\n\\n"
-            "🔍 RESEARCH\\n"
-            "  /research [project] — deep analysis\\n\\n"
-            "💼 JOBS & APPLICATIONS\\n"
-            "  /jobs — latest listings\\n"
-            "  /apply /applications /update_status\\n\\n"
-            "⚙️ SETTINGS\\n"
+            "🚀 Web3 Career Bot — FULL ACCESS ✅\n\n"
+            "📅 DAILY REPORTS (auto every morning)\n"
+            "  /daily_report — run report right now\n"
+            "  /set_report_time — change report time\n\n"
+            "📊 LIVE SCANS\n"
+            "  /funding_stats — live funding news\n"
+            "  /twitter_scan  — Twitter signals\n"
+            "  /scout_communities — Telegram scout\n\n"
+            "🔍 RESEARCH\n"
+            "  /research [project] — deep analysis\n\n"
+            "💼 JOBS & APPLICATIONS\n"
+            "  /jobs — latest listings\n"
+            "  /apply /applications /update_status\n\n"
+            "⚙️ SETTINGS\n"
             "  /preferences /status /weekly_report")
 
 # ── /verify ───────────────────────────────────────────────────────
@@ -132,8 +132,8 @@ async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /verify [code]"); return
     if verify_user(update.effective_chat.id, " ".join(context.args)):
         await update.message.reply_text(
-            "✅ ACCESS GRANTED! Welcome 🚀\\n\\n"
-            "Your daily morning intelligence report starts tomorrow.\\n"
+            "✅ ACCESS GRANTED! Welcome 🚀\n\n"
+            "Your daily morning intelligence report starts tomorrow.\n"
             "Or run /daily_report right now for today's data!")
     else:
         await update.message.reply_text("❌ Invalid code. Contact @PelumiAdmin")
@@ -142,14 +142,14 @@ async def verify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def daily_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context): return
     msg = await update.message.reply_text(
-        "🌅 Starting full intelligence scan...\\n\\n"
-        "📡 Scanning all 20 sources:\\n"
-        "CoinGecko · DexScreener · DexTools\\n"
-        "ICO Drops · CryptoRank · Seedify\\n"
-        "Polkastarter · DAO Maker · PinkSale\\n"
-        "CoinList · Binance Launchpad · Messari\\n"
-        "RSS Feeds · Twitter/X · CoinCarp\\n"
-        "Dune · Nomics · Chain Broker\\n\\n"
+        "🌅 Starting full intelligence scan...\n\n"
+        "📡 Scanning all 20 sources:\n"
+        "CoinGecko · DexScreener · DexTools\n"
+        "ICO Drops · CryptoRank · Seedify\n"
+        "Polkastarter · DAO Maker · PinkSale\n"
+        "CoinList · Binance Launchpad · Messari\n"
+        "RSS Feeds · Twitter/X · CoinCarp\n"
+        "Dune · Nomics · Chain Broker\n\n"
         "⏳ This takes 60-90 seconds. Stand by...")
     try:
         await send_daily_report(context.bot)
@@ -162,37 +162,37 @@ async def daily_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id,
             message_id=msg.message_id,
-            text=f"❌ Report failed: {e}\\nTry /funding_stats for a quick scan instead.")
+            text=f"❌ Report failed: {e}\nTry /funding_stats for a quick scan instead.")
 
 # ── /set_report_time ──────────────────────────────────────────────
 async def set_report_time_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context): return
     if not context.args or not context.args[0].isdigit():
         await update.message.reply_text(
-            "⏰ Set your daily report hour (UTC)\\n\\n"
-            "Usage: /set_report_time [hour]\\n"
-            "Example: /set_report_time 8\\n  (sends at 8:00 AM UTC)\\n\\n"
-            f"Current setting: {os.getenv('DAILY_REPORT_HOUR','8')}:00 UTC\\n\\n"
+            "⏰ Set your daily report hour (UTC)\n\n"
+            "Usage: /set_report_time [hour]\n"
+            "Example: /set_report_time 8\n  (sends at 8:00 AM UTC)\n\n"
+            f"Current setting: {os.getenv('DAILY_REPORT_HOUR','8')}:00 UTC\n\n"
             "To change globally, update DAILY_REPORT_HOUR in Railway → Variables")
         return
     hour = int(context.args[0])
     if not 0 <= hour <= 23:
         await update.message.reply_text("❌ Hour must be 0-23"); return
     await update.message.reply_text(
-        f"✅ Report time noted: {hour:02d}:00 UTC\\n\\n"
+        f"✅ Report time noted: {hour:02d}:00 UTC\n\n"
         f"⚠️ To make it permanent, set DAILY_REPORT_HOUR={hour} in Railway Variables tab.")
 
 # ── /subscribe ────────────────────────────────────────────────────
 async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context): return
     await update.message.reply_text(
-        "🔔 You are subscribed to daily reports!\\n\\n"
-        "Every morning you will receive:\\n"
-        "• Full scan of all 20 sources\\n"
-        "• Every new project found\\n"
-        "• Risk analysis for each\\n"
-        "• Job opportunities per project\\n"
-        "• Tap-for-detail buttons\\n\\n"
+        "🔔 You are subscribed to daily reports!\n\n"
+        "Every morning you will receive:\n"
+        "• Full scan of all 20 sources\n"
+        "• Every new project found\n"
+        "• Risk analysis for each\n"
+        "• Job opportunities per project\n"
+        "• Tap-for-detail buttons\n\n"
         "Run /daily_report now to see today's results!")
 
 # ── /preferences ─────────────────────────────────────────────────
@@ -205,7 +205,7 @@ async def preferences_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📊 View Current",       callback_data="pref_view")],
     ]
     await update.message.reply_text(
-        "⚙️ PREFERENCES\\nChoose what to configure:",
+        "⚙️ PREFERENCES\nChoose what to configure:",
         reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -216,7 +216,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if q.data == "pref_view":
         await q.edit_message_text("📊 Use /status for full settings overview.")
     else:
-        await q.edit_message_text(f"⚙️ Use /preferences to reconfigure settings.\\n{q.data}")
+        await q.edit_message_text(f"⚙️ Use /preferences to reconfigure settings.\n{q.data}")
 
 # ── /research ─────────────────────────────────────────────────────
 async def research_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -225,7 +225,7 @@ async def research_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: /research [project name]"); return
     project = " ".join(context.args)
     msg     = await update.message.reply_text(
-        f"🔍 Researching {project}...\\n⏳ 30-60 seconds...")
+        f"🔍 Researching {project}...\n⏳ 30-60 seconds...")
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=15),
@@ -239,8 +239,8 @@ async def research_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not coins:
                 await context.bot.edit_message_text(
                     chat_id=update.effective_chat.id, message_id=msg.message_id,
-                    text=(f"🔍 Research: {project}\\n\\n"
-                          "Not found on CoinGecko — may be very early stage.\\n\\n"
+                    text=(f"🔍 Research: {project}\n\n"
+                          "Not found on CoinGecko — may be very early stage.\n\n"
                           "Try /daily_report to see all newly discovered projects."))
                 return
             cid = coins[0]["id"]
@@ -260,31 +260,47 @@ async def research_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             mcap   = mkt.get("market_cap",{}).get("usd",0) or 0
             price  = mkt.get("current_price",{}).get("usd",0) or 0
             change = mkt.get("price_change_percentage_24h",0) or 0
-            await context.bot.edit_message_text(
-                chat_id=update.effective_chat.id, message_id=msg.message_id,
-                text=(f"📊 RESEARCH: {name.upper()}\\n{'━'*30}\\n\\n"
-                      f"📋 {desc[:400]}\\n\\n"
-                      f"{'━'*30}\\n📱 SOCIALS\\n"
-                      f"  🌐 {web}\\n  🐦 {tw}\\n"
-                      f"  📱 Telegram: {tg}\\n  💻 GitHub: {gh}\\n\\n"
-                      f"{'━'*30}\\n💰 MARKET\\n"
-                      f"  Price: ${price:,.6f}\\n"
-                      f"  Market Cap: ${mcap:,.0f}\\n"
-                      f"  24h Change: {change:.1f}%\\n\\n"
-                      f"💡 /jobs for roles in this space"),
-                disable_web_page_preview=True)
+            # Delete the loading message, then send each section clean
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id, message_id=msg.message_id)
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                parse_mode="Markdown",
+                text=f"📊 *RESEARCH: {name.upper()}*\n\n{desc[:500]}")
+            await asyncio.sleep(0.3)
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                disable_web_page_preview=True,
+                parse_mode="Markdown",
+                text=(f"📱 *WHERE TO FIND THEM*\n\n"
+                      f"🌐 Website: {web}\n"
+                      f"🐦 Twitter: {tw}\n"
+                      f"✈️ Telegram: {tg}\n"
+                      f"💻 GitHub: {gh}"))
+            await asyncio.sleep(0.3)
+
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                parse_mode="Markdown",
+                text=(f"📊 *MARKET DATA*\n\n"
+                      f"💵 Price: ${price:,.6f}\n"
+                      f"🏦 Market Cap: ${mcap:,.0f}\n"
+                      f"📈 24h Change: {change:+.1f}%\n\n"
+                      f"💼 Use /jobs for roles in this space."))
     except Exception as e:
         logger.error(f"research: {e}")
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id, message_id=msg.message_id,
-            text=f"❌ Research failed: {e}\\nTry again shortly.")
+            text=f"❌ Research failed: {e}\nTry again shortly.")
 
 # ── /jobs ─────────────────────────────────────────────────────────
 async def jobs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context): return
     msg = await update.message.reply_text(
-        "💼 Fetching live Web3 jobs...\\n"
-        "🏆 Superteam Earn · ₿ CryptoJobsList · 🌐 Web3.career\\n⏳ 30s...")
+        "💼 Fetching live Web3 jobs...\n"
+        "🏆 Superteam Earn · ₿ CryptoJobsList · 🌐 Web3.career\n⏳ 30s...")
     fallback = [
         {"p":"🏆 Superteam","t":"Community Manager","c":"Web3 Project","s":"$500–3000","u":"https://earn.superteam.fun"},
         {"p":"₿ CryptoJobsList","t":"Social Media Manager","c":"DeFi Protocol","s":"$1000–4000","u":"https://cryptojobslist.com"},
@@ -309,12 +325,12 @@ async def jobs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         jobs = real if real else fallback
         await context.bot.edit_message_text(
             chat_id=update.effective_chat.id, message_id=msg.message_id,
-            text=f"💼 LIVE WEB3 JOBS\\n{'─'*28}\\n{len(jobs)} opportunities found\\n\\nTrack: /apply [url] [company] [title]")
+            text=f"💼 LIVE WEB3 JOBS\n{'─'*28}\n{len(jobs)} opportunities found\n\nTrack: /apply [url] [company] [title]")
         for i,j in enumerate(jobs,1):
             await context.bot.send_message(
                 chat_id=update.effective_chat.id,
                 disable_web_page_preview=True,
-                text=(f"#{i} {j['p']}\\n📌 {j['t']}\\n🏢 {j['c']}\\n💰 {j['s']}\\n🔗 {j['u']}\\n"
+                text=(f"#{i} {j['p']}\n📌 {j['t']}\n🏢 {j['c']}\n💰 {j['s']}\n🔗 {j['u']}\n"
                       f"Track: /apply {j['u']} {j['c'].replace(' ','_')} {j['t'].replace(' ','_')}"))
             await asyncio.sleep(0.4)
     except Exception as e:
@@ -328,7 +344,7 @@ async def apply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context): return
     if len(context.args) < 3:
         await update.message.reply_text(
-            "📝 /apply [url] [company] [title]\\n\\nExample:\\n"
+            "📝 /apply [url] [company] [title]\n\nExample:\n"
             "/apply https://earn.superteam.fun Chainlink Community_Manager"); return
     chat_id  = update.effective_chat.id
     url      = context.args[0]
@@ -339,9 +355,9 @@ async def apply_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     app_id   = hashlib.md5(f"{chat_id}{url}{int(time.time())}".encode()).hexdigest()[:8]
     if add_application(chat_id,app_id,company,title,platform,url):
         await update.message.reply_text(
-            f"✅ Application Tracked!\\n📌 {title}\\n🏢 {company}\\n"
-            f"🆔 {app_id}\\n📊 Status: Pending\\n\\n"
-            f"Update: /update_status {app_id} applied\\nView all: /applications")
+            f"✅ Application Tracked!\n📌 {title}\n🏢 {company}\n"
+            f"🆔 {app_id}\n📊 Status: Pending\n\n"
+            f"Update: /update_status {app_id} applied\nView all: /applications")
     else:
         await update.message.reply_text("❌ Error. Try again.")
 
@@ -351,27 +367,27 @@ async def applications_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     rows    = get_applications(chat_id)
     if not rows:
-        await update.message.reply_text("📋 No applications yet.\\nBrowse /jobs then /apply"); return
+        await update.message.reply_text("📋 No applications yet.\nBrowse /jobs then /apply"); return
     total = len(rows)
     stats = {}
     for r in rows: stats[r[6]] = stats.get(r[6],0)+1
     resp = stats.get("response_received",0)
     ints = stats.get("interview_scheduled",0)
     await update.message.reply_text(
-        f"📊 JOB PIPELINE\\n{'━'*24}\\n"
-        f"Total: {total}  Applied: {stats.get('applied',0)}\\n"
-        f"Responses: {resp} ({f'{(resp/total)*100:.0f}%' if total else 'N/A'})\\n"
-        f"Interviews: {ints}  Accepted: {stats.get('accepted',0)}\\n\\n"
-        f"{'━'*24}\\nRECENT APPLICATIONS")
+        f"📊 JOB PIPELINE\n{'━'*24}\n"
+        f"Total: {total}  Applied: {stats.get('applied',0)}\n"
+        f"Responses: {resp} ({f'{(resp/total)*100:.0f}%' if total else 'N/A'})\n"
+        f"Interviews: {ints}  Accepted: {stats.get('accepted',0)}\n\n"
+        f"{'━'*24}\nRECENT APPLICATIONS")
     icons = {"pending":"⏳","applied":"📤","response_received":"📬",
              "interview_scheduled":"📅","rejected":"❌","accepted":"🎉"}
     for row in rows[:8]:
         icon = icons.get(row[6],"❓")
         days = (datetime.now()-datetime.fromisoformat(row[5])).days
         await context.bot.send_message(chat_id=chat_id, disable_web_page_preview=True,
-            text=(f"{icon} {row[3]}\\n🏢 {row[2]}\\n"
-                  f"📅 {days}d ago · 🆔 {row[0]}\\n"
-                  f"📊 {row[6].replace('_',' ').title()}\\n🔗 {row[7]}\\n"
+            text=(f"{icon} {row[3]}\n🏢 {row[2]}\n"
+                  f"📅 {days}d ago · 🆔 {row[0]}\n"
+                  f"📊 {row[6].replace('_',' ').title()}\n🔗 {row[7]}\n"
                   f"Update: /update_status {row[0]} [status]"))
         await asyncio.sleep(0.3)
 
@@ -380,7 +396,7 @@ async def update_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await guard(update, context): return
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: /update_status [app_id] [status]\\n\\n"
+            "Usage: /update_status [app_id] [status]\n\n"
             "Statuses: pending applied response interview rejected accepted withdrawn"); return
     chat_id = update.effective_chat.id
     app_id  = context.args[0]
@@ -391,7 +407,7 @@ async def update_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         extra = {"accepted":"🎊 CONGRATULATIONS!","interview_scheduled":"💪 Good luck!",
                  "rejected":"💪 Keep going!"}.get(status,"")
         await update.message.reply_text(
-            f"✅ Updated\\n🆔 {app_id}\\n📊 {status.replace('_',' ').title()}\\n{extra}\\n\\n/applications")
+            f"✅ Updated\n🆔 {app_id}\n📊 {status.replace('_',' ').title()}\n{extra}\n\n/applications")
     else:
         await update.message.reply_text("❌ ID not found. Check /applications")
 
@@ -411,16 +427,16 @@ async def weekly_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.close()
     log_txt = ""
     if log_row:
-        log_txt = (f"\\n📡 Last Report: {log_row['report_date']}\\n"
+        log_txt = (f"\n📡 Last Report: {log_row['report_date']}\n"
                    f"  Sources: {log_row['sources_checked']}  "
                    f"Projects: {log_row['projects_found']}")
     await update.message.reply_text(
-        f"📅 WEEKLY REPORT — {datetime.now().strftime('%B %d, %Y')}\\n{'━'*30}\\n\\n"
-        f"💼 New applications this week: {new_week}\\n"
-        f"📊 Total pipeline: {total}\\n"
-        f"{log_txt}\\n\\n"
-        f"🔍 /daily_report — full today's scan\\n"
-        f"💼 /jobs — new opportunities\\n"
+        f"📅 WEEKLY REPORT — {datetime.now().strftime('%B %d, %Y')}\n{'━'*30}\n\n"
+        f"💼 New applications this week: {new_week}\n"
+        f"📊 Total pipeline: {total}\n"
+        f"{log_txt}\n\n"
+        f"🔍 /daily_report — full today's scan\n"
+        f"💼 /jobs — new opportunities\n"
         f"📊 /applications — manage pipeline")
 
 # ── /scout_communities ────────────────────────────────────────────
